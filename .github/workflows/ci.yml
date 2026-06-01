@@ -68,13 +68,6 @@ jobs:
     steps:
       # Distro containers ship no compiler/linker; install the minimum. carpool
       # has no C or TLS deps, so no openssl or pkg-config is needed here.
-      - name: Prep (debian)
-        if: matrix.env.name == 'debian'
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            git curl ca-certificates build-essential
-
       - name: Prep (arch)
         if: matrix.env.name == 'arch'
         run: |
