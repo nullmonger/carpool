@@ -1,38 +1,15 @@
 use std::future::Future;
 use std::hash::Hash;
 
-/// A downstream source that a `BatchLoader` batches and deduplicates calls
-/// against.
-///
-/// Implement this to define how an input maps to a dedup key and how a
-/// deduplicated batch is fetched.
-///
-/// # Contract
-///
-/// `load` receives inputs already deduplicated by [`Key`](Self::Key) and must
-/// return a `Vec<Output>` of the same length and order: the output at index
-/// `i` answers the input at index `i`. Violating it surfaces to callers as
-/// `Error::ContractViolation`.
 pub trait BatchCollector: Send + Sync + 'static {
-    /// A single request handed to the loader.
     type Input: Send + 'static;
-
-    /// The result produced for one input; cloned to every caller that shared
-    /// its key.
     type Output: Send + Clone + 'static;
-
-    /// Dedup key: inputs with the same key share one downstream slot.
     type Key: Hash + Eq + Send + Clone + 'static;
-
-    /// Failure returned by [`load`](Self::load); cloned to every caller waiting
-    /// on the batch. Must implement [`std::error::Error`].
     type Error: std::error::Error + Send + Sync + Clone + 'static;
 
-    /// Extracts the dedup key for an input.
     fn key(&self, input: &Self::Input) -> Self::Key;
 
-    /// Fetches one deduplicated batch. See the trait [contract](Self#contract)
-    /// for the length and ordering requirements on the returned vector.
+    // inputs are deduplicated by key; output must be position-aligned to them
     fn load(
         &self,
         inputs: Vec<Self::Input>,

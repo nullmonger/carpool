@@ -1,30 +1,14 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-/// Tuning for a `BatchLoader`: collection window, batch size, and the limits
-/// that bound concurrency and waiting.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct BatchLoaderConfig {
-    /// Time a batch stays open collecting calls before it is flushed. Closes
-    /// early once [`max_batch_size`](Self::max_batch_size) is reached.
-    /// Default: 30ms.
     pub window: Duration,
-
-    /// Upper bound on inputs per batch; reaching it closes the window
-    /// immediately. Default: 1024.
     pub max_batch_size: NonZeroUsize,
-
-    /// Deadline for one `BatchCollector::load`, measured from dispatch.
-    /// Default: 30s.
     pub timeout: Duration,
-
-    /// Max batches in flight at once. `None` means unbounded. Default: `None`.
     pub concurrency_limit: Option<NonZeroUsize>,
-
-    /// Max time a batch waits for a slot before its callers fail. Only
-    /// meaningful with [`concurrency_limit`](Self::concurrency_limit) set.
-    /// Default: `None`.
+    // only consulted when concurrency_limit is set
     pub max_waiting: Option<Duration>,
 }
 

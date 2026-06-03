@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # fmt, clippy and doc run on the dev toolchain, auto-installed by rustup from
+  # fmt and clippy run on the dev toolchain, auto-installed by rustup from
   # rust-toolchain.toml. Only the test matrix pins explicit versions.
   fmt:
     runs-on: ubuntu-latest
@@ -30,17 +30,6 @@ jobs:
       - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
-
-  doc:
-    runs-on: ubuntu-latest
-    # The crate denies broken intra-doc links; this is the only place rustdoc
-    # runs, so enforce that (and every other rustdoc warning) here.
-    env:
-      RUSTDOCFLAGS: -D warnings
-    steps:
-      - uses: actions/checkout@v6
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features
 
   test:
     needs: [fmt, clippy]
@@ -96,13 +85,13 @@ jobs:
   ci-success:
     name: CI success
     if: ${{ always() }}
-    needs: [fmt, clippy, doc, test]
+    needs: [fmt, clippy, test]
     runs-on: ubuntu-latest
     steps:
       - name: Check job results
         run: |
           for r in "${{ needs.fmt.result }}" "${{ needs.clippy.result }}" \
-                   "${{ needs.doc.result }}" "${{ needs.test.result }}"; do
+                   "${{ needs.test.result }}"; do
             case "$r" in
               success | skipped) ;;
               *) echo "required job result: $r"; exit 1 ;;

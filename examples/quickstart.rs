@@ -1,13 +1,8 @@
-//! Smoke demo of the carpool API surface: implement `BatchCollector`, read the
-//! default config, and see that equal inputs hash to one key. There is no
-//! runtime yet - the real `load` dispatch lands in a later release.
-//!
-//! Run with `cargo run --example quickstart`. Expected output:
-//!
-//! ```text
-//! config: window=30ms max_batch=1024 timeout=30s concurrency=None max_waiting=None
-//! key(7) = 7, key(7) = 7 -> one key, one shared ride
-//! ```
+// Smoke demo: implement BatchCollector, read the default config, see that equal
+// inputs hash to one key. Run: cargo run --example quickstart
+// Expected output:
+//   config: window=30ms max_batch=1024 timeout=30s concurrency=None max_waiting=None
+//   key(7) = 7, key(7) = 7 -> one key, one shared ride
 
 use carpool::{BatchCollector, BatchLoaderConfig};
 

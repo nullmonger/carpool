@@ -1,28 +1,11 @@
 use std::fmt;
 
-/// Failure surfaced to a caller of `BatchLoader::load`.
-///
-/// Generic over the collector's own error type `E`, which rides unchanged in
-/// [`Collector`](Self::Collector).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Error<E> {
-    /// The collector's `load` returned an error; carries it unchanged.
     Collector(E),
-
-    /// The collector returned the wrong number of outputs, breaking the
-    /// position-aligned contract.
-    ContractViolation {
-        /// Outputs expected: the deduplicated input count.
-        expected: usize,
-        /// Outputs the collector actually returned.
-        got: usize,
-    },
-
-    /// A batch exceeded the configured per-batch `timeout`.
+    ContractViolation { expected: usize, got: usize },
     Timeout,
-
-    /// A batch waited longer than `max_waiting` for a concurrency slot.
     WaitingTimeout,
 }
 
