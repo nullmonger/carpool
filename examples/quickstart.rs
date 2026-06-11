@@ -1,8 +1,11 @@
-// Smoke demo: implement BatchCollector, read the default config, see that equal
-// inputs hash to one key. Run: cargo run --example quickstart
+// Smoke demo: implement BatchCollector, read the default config,
+// see that equal inputs map to the same key.
+// Run: cargo run --example quickstart
 // Expected output:
 //   config: window=30ms max_batch=1024 timeout=30s concurrency=None max_waiting=None
-//   key(7) = 7, key(7) = 7 -> one key, one shared ride
+//   key(7) = 7, key(7) = 7 -> equal inputs share one batch entry
+
+use std::collections::HashMap;
 
 use carpool::{BatchCollector, BatchLoaderConfig};
 
@@ -18,8 +21,8 @@ impl BatchCollector for SquareLoader {
         *input
     }
 
-    async fn load(&self, inputs: Vec<u64>) -> Result<Vec<u64>, Self::Error> {
-        Ok(inputs.iter().map(|n| n * n).collect())
+    async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Self::Error> {
+        Ok(batch.into_iter().map(|(k, n)| (k, n * n)).collect())
     }
 }
 
@@ -36,5 +39,5 @@ fn main() {
 
     let loader = SquareLoader;
     let (a, b) = (loader.key(&7), loader.key(&7));
-    println!("key(7) = {a}, key(7) = {b} -> one key, one shared ride");
+    println!("key(7) = {a}, key(7) = {b} -> equal inputs share one batch entry");
 }
