@@ -17,9 +17,6 @@ use tokio::time::{self, Instant};
 // `collect` batches opaque `T` by time and size only and spawns no task: both
 // channel-close paths are normal teardown, not errors (inbound closed - source
 // gone, flush and stop; outbound closed - consumer gone, stop).
-//
-// No caller yet: the loader that drives this window is not built.
-#[allow(dead_code)]
 pub(crate) async fn collect<T>(
     mut inbound: mpsc::Receiver<T>,
     outbound: mpsc::Sender<Vec<T>>,

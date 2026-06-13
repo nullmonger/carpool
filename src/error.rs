@@ -14,6 +14,9 @@ pub enum Error<E> {
     MissingOutput,
     Timeout,
     WaitingTimeout,
+    // the loader's background pipeline has shut down, so the request cannot be
+    // served (for example a downstream panic tore the dispatcher down)
+    Closed,
 }
 
 impl<E: fmt::Display> fmt::Display for Error<E> {
@@ -27,6 +30,7 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
             Error::MissingOutput => f.write_str("collector returned no output for a requested key"),
             Error::Timeout => f.write_str("batch timed out"),
             Error::WaitingTimeout => f.write_str("timed out waiting for a concurrency slot"),
+            Error::Closed => f.write_str("the batch loader has shut down"),
         }
     }
 }
@@ -38,7 +42,8 @@ impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
             Error::ContractViolation { .. }
             | Error::MissingOutput
             | Error::Timeout
-            | Error::WaitingTimeout => None,
+            | Error::WaitingTimeout
+            | Error::Closed => None,
         }
     }
 }

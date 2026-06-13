@@ -1,6 +1,3 @@
-// No caller yet: the public loader that drives this dispatch is not built.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use tokio::sync::oneshot;
@@ -8,13 +5,18 @@ use tokio::sync::oneshot;
 use crate::collector::BatchCollector;
 use crate::error::Error;
 
+// The one-shot reply a waiting caller holds. Factored into an alias because the
+// nested generics otherwise trip clippy's type-complexity lint at each use site.
+type Responder<C> =
+    oneshot::Sender<Result<<C as BatchCollector>::Output, Error<<C as BatchCollector>::Error>>>;
+
 // One queued load: its key, the input to fold into the batch, and the one-shot
 // channel that carries the result back to the waiting caller. Stays internal -
 // the oneshot never appears in the public `load` signature.
 pub(crate) struct Request<C: BatchCollector> {
     pub(crate) key: C::Key,
     pub(crate) input: C::Input,
-    pub(crate) respond: oneshot::Sender<Result<C::Output, Error<C::Error>>>,
+    pub(crate) respond: Responder<C>,
 }
 
 // Collapse a closed window into one downstream call and hand each result back to
@@ -24,8 +26,7 @@ pub(crate) async fn dispatch_window<C: BatchCollector>(collector: &C, batch: Vec
     // grouped under its key so the result reaches all of them. Addressing is by
     // key, never by position - inputs sharing a key are interchangeable.
     let mut inputs: HashMap<C::Key, C::Input> = HashMap::new();
-    let mut waiters: HashMap<C::Key, Vec<oneshot::Sender<Result<C::Output, Error<C::Error>>>>> =
-        HashMap::new();
+    let mut waiters: HashMap<C::Key, Vec<Responder<C>>> = HashMap::new();
     for Request {
         key,
         input,
@@ -83,17 +84,14 @@ pub(crate) async fn dispatch_window<C: BatchCollector>(collector: &C, batch: Vec
     }
 }
 
-fn deliver<C: BatchCollector>(
-    respond: oneshot::Sender<Result<C::Output, Error<C::Error>>>,
-    result: Result<C::Output, Error<C::Error>>,
-) {
+fn deliver<C: BatchCollector>(respond: Responder<C>, result: Result<C::Output, Error<C::Error>>) {
     let delivered = respond.send(result).is_ok();
     warn_if_dropped(delivered);
 }
 
 // A dropped waiter is benign - the caller cancelled - but it is never silently
 // ignored: when `tracing` is compiled in we surface it at warn level, otherwise
-// there is no log facade to write to. Full drop cancel-safety is a later task.
+// there is no log facade to write to.
 #[cfg(feature = "tracing")]
 fn warn_if_dropped(delivered: bool) {
     if !delivered {
@@ -200,7 +198,11 @@ mod tests {
         dispatch_window(&collector, vec![a, b, c]).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one downstream call");
-        assert_eq!(batch_len.load(Ordering::SeqCst), 2, "three requests, two unique keys");
+        assert_eq!(
+            batch_len.load(Ordering::SeqCst),
+            2,
+            "three requests, two unique keys"
+        );
         assert_eq!(rx_a.await.unwrap().unwrap(), 1);
         assert_eq!(rx_b.await.unwrap().unwrap(), 1);
         assert_eq!(rx_c.await.unwrap().unwrap(), 4);
