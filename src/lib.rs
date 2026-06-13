@@ -2,6 +2,7 @@
 
 mod collector;
 mod config;
+mod dispatch;
 mod error;
 mod window;
 
