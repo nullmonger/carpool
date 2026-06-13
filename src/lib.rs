@@ -3,6 +3,7 @@
 mod collector;
 mod config;
 mod error;
+mod window;
 
 pub use collector::BatchCollector;
 pub use config::BatchLoaderConfig;

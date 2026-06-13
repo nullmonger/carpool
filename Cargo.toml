@@ -11,7 +11,7 @@ keywords = ["async", "batch", "dataloader", "dedup", "tokio"]
 categories = ["asynchronous", "concurrency"]
 
 [dependencies]
-tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["sync", "time", "macros"] }
 tracing = { version = "0.1", optional = true }
 metrics = { version = "0.24", optional = true }
 
@@ -21,4 +21,4 @@ tracing = ["dep:tracing"]
 metrics = ["dep:metrics"]
 
 [dev-dependencies]
-tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "test-util"] }
