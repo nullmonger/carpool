@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
 
-pub trait BatchCollector: Send + Sync + 'static {
+// Clone: loader and dispatcher hold separate clones -
+// key() must be pure, shared state behind an Arc.
+pub trait BatchCollector: Clone + Send + Sync + 'static {
     type Input: Send + 'static;
     type Output: Send + Clone + 'static;
     type Key: Hash + Eq + Send + Clone + 'static;
@@ -27,6 +29,7 @@ pub trait BatchCollector: Send + Sync + 'static {
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
     struct SquareLoader;
 
     impl BatchCollector for SquareLoader {

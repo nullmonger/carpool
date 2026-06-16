@@ -121,6 +121,7 @@ mod tests {
     impl std::error::Error for TestError {}
 
     // What the collector does with a batch, so each contract branch can be driven.
+    #[derive(Clone)]
     enum Behavior {
         Square,
         OmitKey(u64),
@@ -128,6 +129,7 @@ mod tests {
         Fail,
     }
 
+    #[derive(Clone)]
     struct TestCollector {
         calls: Arc<AtomicUsize>,
         batch_len: Arc<AtomicUsize>,

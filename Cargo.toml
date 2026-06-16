@@ -12,6 +12,7 @@ categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 tokio = { version = "1", default-features = false, features = ["sync", "time", "macros", "rt"] }
+thiserror = "2"
 tracing = { version = "0.1", optional = true }
 metrics = { version = "0.24", optional = true }
 

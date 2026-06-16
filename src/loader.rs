@@ -1,6 +1,3 @@
-use std::future::Future;
-use std::sync::Arc;
-
 use tokio::sync::{mpsc, oneshot};
 
 use crate::collector::BatchCollector;
@@ -11,27 +8,17 @@ use crate::window;
 
 // Public runtime: every `load` drops its request into the collection window and
 // awaits a one-shot reply. A background dispatcher turns each closed window into
-// one deduplicated downstream call and fans the results back out by key. Cloning
-// is cheap (an `Arc` and a channel sender), so the loader is shared across tasks.
+// one deduplicated downstream call and fans the results back out by key.
+// Cloning is cheap (a collector clone and a sender), so the loader is shared across tasks.
+#[derive(Clone)]
 pub struct BatchLoader<C: BatchCollector> {
-    collector: Arc<C>,
+    collector: C,
     inbound: mpsc::Sender<Request<C>>,
 }
 
-// Hand-written so the bound is `C`, not `C: Clone` - cloning shares the runtime,
-// it does not copy the collector.
-impl<C: BatchCollector> Clone for BatchLoader<C> {
-    fn clone(&self) -> Self {
-        Self {
-            collector: self.collector.clone(),
-            inbound: self.inbound.clone(),
-        }
-    }
-}
-
 impl<C: BatchCollector> BatchLoader<C> {
-    pub fn new(collector: C, config: BatchLoaderConfig) -> Self {
-        let collector = Arc::new(collector);
+    // spawn, not new: two background tasks start eagerly; a lazy ctor can come later.
+    pub fn spawn(collector: C, config: BatchLoaderConfig) -> Self {
         // inbound buffers a burst up to one window's worth; outbound holds at most
         // one closed window awaiting dispatch - deeper buffering would only hide
         // backpressure behind memory.
@@ -52,46 +39,39 @@ impl<C: BatchCollector> BatchLoader<C> {
     }
 
     // The key is derived through the collector so dedup and dispatch address the
-    // same key the implementor sees. The returned future is `Send + 'static` and
-    // owns its inbound sender, so it can be spawned and still keeps the window
-    // task alive long enough to answer even if the loader is dropped meanwhile.
-    pub fn load(
-        &self,
-        input: C::Input,
-    ) -> impl Future<Output = Result<C::Output, Error<C::Error>>> + Send + 'static {
+    // same key the implementor sees.
+    pub async fn load(&self, input: C::Input) -> Result<C::Output, Error<C::Error>> {
         let key = self.collector.key(&input);
-        let inbound = self.inbound.clone();
         let (respond, reply) = oneshot::channel();
-        async move {
-            if inbound
-                .send(Request {
-                    key,
-                    input,
-                    respond,
-                })
-                .await
-                .is_err()
-            {
-                return Err(Error::Closed);
-            }
-            match reply.await {
-                Ok(result) => result,
-                // The dispatcher dropped our responder without answering (a
-                // downstream panic can tear it down), so the loader cannot serve.
-                Err(_) => Err(Error::Closed),
-            }
+        if self
+            .inbound
+            .send(Request {
+                key,
+                input,
+                respond,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Error::Closed);
+        }
+        match reply.await {
+            Ok(result) => result,
+            // The dispatcher dropped our responder without answering
+            // (a downstream panic can tear it down), so the loader cannot serve.
+            Err(_) => Err(Error::Closed),
         }
     }
 }
 
 async fn run_dispatcher<C: BatchCollector>(
-    collector: Arc<C>,
+    collector: C,
     mut windows: mpsc::Receiver<Vec<Request<C>>>,
 ) {
     // One closed window at a time, one downstream call each. Ends when the window
     // task drops its sender (all loaders gone), winding the runtime down.
     while let Some(batch) = windows.recv().await {
-        dispatch_window(collector.as_ref(), batch).await;
+        dispatch_window(&collector, batch).await;
     }
 }
 
@@ -134,7 +114,15 @@ mod tests {
             max_batch_size: NonZeroUsize::new(max).expect("max is non-zero"),
             ..BatchLoaderConfig::default()
         };
-        BatchLoader::new(Squares { calls }, config)
+        BatchLoader::spawn(Squares { calls }, config)
+    }
+
+    fn spawn_load(
+        loader: &BatchLoader<Squares>,
+        input: u64,
+    ) -> tokio::task::JoinHandle<Result<u64, Error<std::convert::Infallible>>> {
+        let loader = loader.clone();
+        tokio::spawn(async move { loader.load(input).await })
     }
 
     async fn collect_results(
@@ -156,7 +144,7 @@ mod tests {
 
         let handles = [1u64, 1, 1, 2, 2]
             .into_iter()
-            .map(|k| tokio::spawn(loader.load(k)))
+            .map(|k| spawn_load(&loader, k))
             .collect();
         let results = collect_results(handles).await;
 
@@ -176,7 +164,7 @@ mod tests {
 
         let handles = [2u64, 3, 4]
             .into_iter()
-            .map(|k| tokio::spawn(loader.load(k)))
+            .map(|k| spawn_load(&loader, k))
             .collect();
         let results = collect_results(handles).await;
 
@@ -191,14 +179,14 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let loader = loader(1, calls.clone());
 
-        let first = tokio::spawn(loader.load(5))
+        let first = spawn_load(&loader, 5)
             .await
             .expect("task joins")
             .expect("load succeeds");
         assert_eq!(first, 25);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let second = tokio::spawn(loader.load(6))
+        let second = spawn_load(&loader, 6)
             .await
             .expect("task joins")
             .expect("load succeeds");
@@ -208,5 +196,19 @@ mod tests {
             2,
             "the later load opens a fresh window"
         );
+    }
+
+    // Regression guard: load must stay Send so a cloned loader can spawn it.
+    #[tokio::test(start_paused = true)]
+    async fn load_future_is_send_after_clone() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let loader = loader(1, calls);
+
+        let value = spawn_load(&loader, 7)
+            .await
+            .expect("task joins")
+            .expect("load succeeds");
+
+        assert_eq!(value, 49);
     }
 }

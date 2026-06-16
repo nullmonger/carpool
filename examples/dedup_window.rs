@@ -33,7 +33,7 @@ impl BatchCollector for CountingSquares {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let loader = BatchLoader::new(
+    let loader = BatchLoader::spawn(
         CountingSquares {
             calls: calls.clone(),
         },
@@ -41,7 +41,12 @@ async fn main() {
     );
 
     // A hundred concurrent loads, but only four distinct keys.
-    let handles: Vec<_> = (0..100u64).map(|i| tokio::spawn(loader.load(i))).collect();
+    let handles: Vec<_> = (0..100u64)
+        .map(|i| {
+            let loader = loader.clone();
+            tokio::spawn(async move { loader.load(i).await })
+        })
+        .collect();
 
     let mut results = Vec::new();
     for handle in handles {

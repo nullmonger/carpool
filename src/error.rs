@@ -1,51 +1,26 @@
-use std::fmt;
+use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Error)]
 #[non_exhaustive]
 pub enum Error<E> {
-    Collector(E),
-    // implementor bug: the response carries keys that were not in the batch;
-    // not attributable to any single caller, so the whole batch fails
-    // TODO: consider #[non_exhaustive] on this variant before 1.0 -
-    // enum-level #[non_exhaustive] does not stop exhaustive field destructuring
+    // #[source], not #[from]: #[from] would generate From<E> and clash for a generic E
+    #[error("collector failed: {0}")]
+    Collector(#[source] E),
+    // implementor bug: response key not in the batch - fails the whole batch
+    #[error(
+        "collector broke the key-addressed contract: {unknown_keys} unknown key(s) in the response"
+    )]
     ContractViolation { unknown_keys: usize },
-    // implementor bug: no output under a requested key; not a domain "not found" -
-    // absence semantics belong to the implementor's Output type
+    // implementor bug: no output for a requested key - not a domain "not found"
+    #[error("collector returned no output for a requested key")]
     MissingOutput,
+    #[error("batch timed out")]
     Timeout,
+    #[error("timed out waiting for a concurrency slot")]
     WaitingTimeout,
-    // the loader's background pipeline has shut down, so the request cannot be
-    // served (for example a downstream panic tore the dispatcher down)
+    // background pipeline shut down (for example a downstream panic tore the dispatcher down)
+    #[error("the batch loader has shut down")]
     Closed,
-}
-
-impl<E: fmt::Display> fmt::Display for Error<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Collector(e) => write!(f, "collector failed: {e}"),
-            Error::ContractViolation { unknown_keys } => write!(
-                f,
-                "collector broke the key-addressed contract: {unknown_keys} unknown key(s) in the response"
-            ),
-            Error::MissingOutput => f.write_str("collector returned no output for a requested key"),
-            Error::Timeout => f.write_str("batch timed out"),
-            Error::WaitingTimeout => f.write_str("timed out waiting for a concurrency slot"),
-            Error::Closed => f.write_str("the batch loader has shut down"),
-        }
-    }
-}
-
-impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Collector(e) => Some(e),
-            Error::ContractViolation { .. }
-            | Error::MissingOutput
-            | Error::Timeout
-            | Error::WaitingTimeout
-            | Error::Closed => None,
-        }
-    }
 }
 
 #[cfg(test)]

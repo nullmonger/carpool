@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use carpool::{BatchCollector, BatchLoaderConfig};
 
+#[derive(Clone)]
 struct SquareLoader;
 
 impl BatchCollector for SquareLoader {
