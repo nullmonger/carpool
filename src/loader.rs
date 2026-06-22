@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
@@ -36,7 +38,12 @@ impl<C: BatchCollector> BatchLoader<C> {
             config.window,
             config.max_batch_size,
         ));
-        tokio::spawn(run_dispatcher(collector.clone(), windows_rx, slots));
+        tokio::spawn(run_dispatcher(
+            collector.clone(),
+            windows_rx,
+            slots,
+            config.timeout,
+        ));
 
         Self { collector, inbound }
     }
@@ -71,6 +78,7 @@ async fn run_dispatcher<C: BatchCollector>(
     collector: C,
     mut windows: mpsc::Receiver<Vec<Request<C>>>,
     slots: Slots,
+    timeout: Duration,
 ) {
     // One task per window for parallel batches, capped by Slots. The set surfaces
     // a batch panic as a warning and drains in-flight batches when the source closes.
@@ -81,7 +89,7 @@ async fn run_dispatcher<C: BatchCollector>(
                 Some(batch) => {
                     let collector = collector.clone();
                     let slots = slots.clone();
-                    batches.spawn(async move { slots.run(collector, batch).await });
+                    batches.spawn(async move { slots.run(collector, batch, timeout).await });
                 }
                 None => break,
             },
@@ -488,5 +496,69 @@ mod tests {
 
         assert_eq!(value, 36);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Sleeps past the deadline on its first downstream call, returns at once after.
+    #[derive(Clone)]
+    struct SlowOnce {
+        calls: Arc<AtomicUsize>,
+        slow: Duration,
+    }
+
+    impl BatchCollector for SlowOnce {
+        type Input = u64;
+        type Output = u64;
+        type Key = u64;
+        type Error = std::convert::Infallible;
+
+        fn key(&self, input: &u64) -> u64 {
+            *input
+        }
+
+        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Self::Error> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                tokio::time::sleep(self.slow).await;
+            }
+            Ok(batch)
+        }
+    }
+
+    // Looped on virtual time to surface a cleanup race: a timed-out batch must not
+    // strand in-flight for the next.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_slower_than_the_timeout_fails_and_the_next_passes() {
+        for _ in 0..50 {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let config = BatchLoaderConfig {
+                window: Duration::from_secs(3600),
+                max_batch_size: NonZeroUsize::new(1).expect("1 is non-zero"),
+                timeout: Duration::from_secs(5),
+                ..BatchLoaderConfig::default()
+            };
+            let loader = BatchLoader::spawn(
+                SlowOnce {
+                    calls: calls.clone(),
+                    slow: Duration::from_secs(3600),
+                },
+                config,
+            );
+
+            let timed_out = spawn_load_on(&loader, 1).await.expect("task joins");
+            assert!(
+                matches!(timed_out, Err(Error::Timeout)),
+                "the slow batch times out"
+            );
+
+            let next = spawn_load_on(&loader, 2)
+                .await
+                .expect("task joins")
+                .expect("load succeeds");
+            assert_eq!(next, 2, "the next batch runs after the timeout");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "downstream was entered for both batches"
+            );
+        }
     }
 }

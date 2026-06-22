@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 
@@ -20,8 +21,12 @@ pub(crate) struct Request<C: BatchCollector> {
 }
 
 // Collapse a closed window into one downstream call and hand each result back to
-// every caller that asked for that key.
-pub(crate) async fn dispatch_window<C: BatchCollector>(collector: &C, batch: Vec<Request<C>>) {
+// every caller that asked for that key. The call is bound by `timeout`.
+pub(crate) async fn dispatch_window<C: BatchCollector>(
+    collector: &C,
+    batch: Vec<Request<C>>,
+    timeout: Duration,
+) {
     // Dedup: one representative input per key for downstream, and every waiter
     // grouped under its key so the result reaches all of them. Addressing is by
     // key, never by position - inputs sharing a key are interchangeable.
@@ -37,30 +42,18 @@ pub(crate) async fn dispatch_window<C: BatchCollector>(collector: &C, batch: Vec
         inputs.entry(key).or_insert(input);
     }
 
-    match collector.load(inputs).await {
-        Err(e) => {
-            // Downstream failed: the whole batch shares the same error.
-            for senders in waiters.into_values() {
-                for respond in senders {
-                    deliver::<C>(respond, Err(Error::Collector(e.clone())));
-                }
-            }
-        }
-        Ok(mut response) => {
+    match tokio::time::timeout(timeout, collector.load(inputs)).await {
+        // Deadline hit: dropping the load future cancels downstream, so it stops
+        // here; every waiter of the batch shares the timeout error.
+        Err(_elapsed) => deliver_to_all::<C>(waiters, Error::Timeout),
+        // Downstream failed: the whole batch shares the same error.
+        Ok(Err(e)) => deliver_to_all::<C>(waiters, Error::Collector(e)),
+        Ok(Ok(mut response)) => {
             // An unknown key in the response is an implementor bug that taints the
             // whole batch and takes precedence over any missing key.
             let unknown = response.keys().filter(|k| !waiters.contains_key(k)).count();
             if unknown > 0 {
-                for senders in waiters.into_values() {
-                    for respond in senders {
-                        deliver::<C>(
-                            respond,
-                            Err(Error::ContractViolation {
-                                unknown_keys: unknown,
-                            }),
-                        );
-                    }
-                }
+                deliver_to_all::<C>(waiters, Error::ContractViolation { unknown_keys: unknown });
                 return;
             }
 
@@ -89,6 +82,18 @@ fn deliver<C: BatchCollector>(respond: Responder<C>, result: Result<C::Output, E
     warn_if_dropped(delivered);
 }
 
+// Hand the same error to every waiter of a batch.
+fn deliver_to_all<C: BatchCollector>(
+    waiters: HashMap<C::Key, Vec<Responder<C>>>,
+    error: Error<C::Error>,
+) {
+    for senders in waiters.into_values() {
+        for respond in senders {
+            deliver::<C>(respond, Err(error.clone()));
+        }
+    }
+}
+
 // Give every waiter the same error without calling downstream (batch dropped pre-dispatch).
 pub(crate) fn fail_batch<C: BatchCollector>(batch: Vec<Request<C>>, error: Error<C::Error>) {
     for Request { respond, .. } in batch {
@@ -115,6 +120,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    // These tests use immediate collectors; the timeout never fires.
+    const NO_TIMEOUT: Duration = Duration::from_secs(3600);
 
     #[derive(Debug, Clone)]
     struct TestError;
@@ -204,7 +212,7 @@ mod tests {
         let (b, rx_b) = req(1, 1);
         let (c, rx_c) = req(2, 2);
 
-        dispatch_window(&collector, vec![a, b, c]).await;
+        dispatch_window(&collector, vec![a, b, c], NO_TIMEOUT).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one downstream call");
         assert_eq!(
@@ -225,7 +233,7 @@ mod tests {
         let (a, rx_a) = req(1, 1);
         let (b, rx_b) = req(2, 2);
 
-        dispatch_window(&collector, vec![a, b]).await;
+        dispatch_window(&collector, vec![a, b], NO_TIMEOUT).await;
 
         assert_eq!(rx_a.await.unwrap().unwrap(), 1);
         assert!(matches!(rx_b.await.unwrap(), Err(Error::MissingOutput)));
@@ -239,7 +247,7 @@ mod tests {
         let (a, rx_a) = req(1, 1);
         let (b, rx_b) = req(2, 2);
 
-        dispatch_window(&collector, vec![a, b]).await;
+        dispatch_window(&collector, vec![a, b], NO_TIMEOUT).await;
 
         assert!(matches!(
             rx_a.await.unwrap(),
@@ -258,7 +266,7 @@ mod tests {
         let (a, rx_a) = req(1, 1);
         let (b, rx_b) = req(2, 2);
 
-        dispatch_window(&collector, vec![a, b]).await;
+        dispatch_window(&collector, vec![a, b], NO_TIMEOUT).await;
 
         assert!(matches!(rx_a.await.unwrap(), Err(Error::Collector(_))));
         assert!(matches!(rx_b.await.unwrap(), Err(Error::Collector(_))));

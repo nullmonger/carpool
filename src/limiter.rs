@@ -37,9 +37,15 @@ impl Slots {
     }
 
     // Hold a slot while limited; the permit frees on drop, so a panic never strands it.
-    pub(crate) async fn run<C: BatchCollector>(&self, collector: C, batch: Vec<Request<C>>) {
+    // `timeout` bounds the downstream call and applies regardless of the slot gate.
+    pub(crate) async fn run<C: BatchCollector>(
+        &self,
+        collector: C,
+        batch: Vec<Request<C>>,
+        timeout: Duration,
+    ) {
         match self {
-            Slots::Unlimited => dispatch_window(&collector, batch).await,
+            Slots::Unlimited => dispatch_window(&collector, batch, timeout).await,
             Slots::Limited {
                 permits,
                 max_waiting,
@@ -55,7 +61,7 @@ impl Slots {
                         }
                     },
                 };
-                dispatch_window(&collector, batch).await;
+                dispatch_window(&collector, batch, timeout).await;
             }
         }
     }
