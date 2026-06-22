@@ -4,6 +4,7 @@ mod collector;
 mod config;
 mod dispatch;
 mod error;
+mod limiter;
 mod loader;
 mod window;
 

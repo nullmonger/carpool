@@ -89,6 +89,13 @@ fn deliver<C: BatchCollector>(respond: Responder<C>, result: Result<C::Output, E
     warn_if_dropped(delivered);
 }
 
+// Give every waiter the same error without calling downstream (batch dropped pre-dispatch).
+pub(crate) fn fail_batch<C: BatchCollector>(batch: Vec<Request<C>>, error: Error<C::Error>) {
+    for Request { respond, .. } in batch {
+        deliver::<C>(respond, Err(error.clone()));
+    }
+}
+
 // A dropped waiter is benign - the caller cancelled - but it is never silently
 // ignored: when `tracing` is compiled in we surface it at warn level, otherwise
 // there is no log facade to write to.

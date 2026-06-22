@@ -1,9 +1,11 @@
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 
 use crate::collector::BatchCollector;
 use crate::config::BatchLoaderConfig;
-use crate::dispatch::{Request, dispatch_window};
+use crate::dispatch::Request;
 use crate::error::Error;
+use crate::limiter::Slots;
 use crate::window;
 
 // Public runtime: every `load` drops its request into the collection window and
@@ -24,6 +26,7 @@ impl<C: BatchCollector> BatchLoader<C> {
         // backpressure behind memory.
         let (inbound, requests) = mpsc::channel::<Request<C>>(config.max_batch_size.get());
         let (windows_tx, windows_rx) = mpsc::channel::<Vec<Request<C>>>(1);
+        let slots = Slots::from_config(&config);
 
         // Both tasks are detached: they end on channel close once every loader
         // clone is dropped, so there is nothing to join.
@@ -33,7 +36,7 @@ impl<C: BatchCollector> BatchLoader<C> {
             config.window,
             config.max_batch_size,
         ));
-        tokio::spawn(run_dispatcher(collector.clone(), windows_rx));
+        tokio::spawn(run_dispatcher(collector.clone(), windows_rx, slots));
 
         Self { collector, inbound }
     }
@@ -67,13 +70,43 @@ impl<C: BatchCollector> BatchLoader<C> {
 async fn run_dispatcher<C: BatchCollector>(
     collector: C,
     mut windows: mpsc::Receiver<Vec<Request<C>>>,
+    slots: Slots,
 ) {
-    // One closed window at a time, one downstream call each. Ends when the window
-    // task drops its sender (all loaders gone), winding the runtime down.
-    while let Some(batch) = windows.recv().await {
-        dispatch_window(&collector, batch).await;
+    // One task per window for parallel batches, capped by Slots. The set surfaces
+    // a batch panic as a warning and drains in-flight batches when the source closes.
+    let mut batches = JoinSet::new();
+    loop {
+        tokio::select! {
+            window = windows.recv() => match window {
+                Some(batch) => {
+                    let collector = collector.clone();
+                    let slots = slots.clone();
+                    batches.spawn(async move { slots.run(collector, batch).await });
+                }
+                None => break,
+            },
+            Some(outcome) = batches.join_next() => report_batch(outcome),
+        }
+    }
+    while let Some(outcome) = batches.join_next().await {
+        report_batch(outcome);
     }
 }
+
+// Results go home over the oneshot; only an abnormal end (a panic) needs surfacing.
+fn report_batch(outcome: Result<(), tokio::task::JoinError>) {
+    if let Err(panicked) = outcome {
+        warn_batch_panicked(&panicked);
+    }
+}
+
+#[cfg(feature = "tracing")]
+fn warn_batch_panicked(err: &tokio::task::JoinError) {
+    tracing::warn!("carpool: a batch task ended abnormally: {err}");
+}
+
+#[cfg(not(feature = "tracing"))]
+fn warn_batch_panicked(_err: &tokio::task::JoinError) {}
 
 #[cfg(test)]
 mod tests {
@@ -82,6 +115,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -117,14 +152,6 @@ mod tests {
         BatchLoader::spawn(Squares { calls }, config)
     }
 
-    fn spawn_load(
-        loader: &BatchLoader<Squares>,
-        input: u64,
-    ) -> tokio::task::JoinHandle<Result<u64, Error<std::convert::Infallible>>> {
-        let loader = loader.clone();
-        tokio::spawn(async move { loader.load(input).await })
-    }
-
     async fn collect_results(
         handles: Vec<tokio::task::JoinHandle<Result<u64, Error<std::convert::Infallible>>>>,
     ) -> Vec<u64> {
@@ -144,7 +171,7 @@ mod tests {
 
         let handles = [1u64, 1, 1, 2, 2]
             .into_iter()
-            .map(|k| spawn_load(&loader, k))
+            .map(|k| spawn_load_on(&loader, k))
             .collect();
         let results = collect_results(handles).await;
 
@@ -164,7 +191,7 @@ mod tests {
 
         let handles = [2u64, 3, 4]
             .into_iter()
-            .map(|k| spawn_load(&loader, k))
+            .map(|k| spawn_load_on(&loader, k))
             .collect();
         let results = collect_results(handles).await;
 
@@ -179,14 +206,14 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let loader = loader(1, calls.clone());
 
-        let first = spawn_load(&loader, 5)
+        let first = spawn_load_on(&loader, 5)
             .await
             .expect("task joins")
             .expect("load succeeds");
         assert_eq!(first, 25);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let second = spawn_load(&loader, 6)
+        let second = spawn_load_on(&loader, 6)
             .await
             .expect("task joins")
             .expect("load succeeds");
@@ -204,11 +231,262 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let loader = loader(1, calls);
 
-        let value = spawn_load(&loader, 7)
+        let value = spawn_load_on(&loader, 7)
             .await
             .expect("task joins")
             .expect("load succeeds");
 
         assert_eq!(value, 49);
+    }
+
+    fn spawn_load_on<C: BatchCollector>(
+        loader: &BatchLoader<C>,
+        input: C::Input,
+    ) -> tokio::task::JoinHandle<Result<C::Output, Error<C::Error>>> {
+        let loader = loader.clone();
+        tokio::spawn(async move { loader.load(input).await })
+    }
+
+    // Records the concurrent-load peak and holds each load for `hold` of virtual
+    // time, so a test can read off how many batches ran downstream at once.
+    #[derive(Clone)]
+    struct Tracked {
+        calls: Arc<AtomicUsize>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        hold: Duration,
+    }
+
+    impl BatchCollector for Tracked {
+        type Input = u64;
+        type Output = u64;
+        type Key = u64;
+        type Error = std::convert::Infallible;
+
+        fn key(&self, input: &u64) -> u64 {
+            *input
+        }
+
+        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.hold).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(batch)
+        }
+    }
+
+    // limit slots, one item per window (each load is its own batch, so they
+    // contend for slots), timer long enough never to fire under virtual time.
+    fn limited_loader(
+        limit: usize,
+        hold: Duration,
+    ) -> (BatchLoader<Tracked>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let collector = Tracked {
+            calls: calls.clone(),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: max_in_flight.clone(),
+            hold,
+        };
+        let config = BatchLoaderConfig {
+            window: Duration::from_secs(3600),
+            max_batch_size: NonZeroUsize::new(1).expect("1 is non-zero"),
+            concurrency_limit: NonZeroUsize::new(limit),
+            ..BatchLoaderConfig::default()
+        };
+        (BatchLoader::spawn(collector, config), calls, max_in_flight)
+    }
+
+    // Limit honored under contention and the queue fully drains. With limit 2 and
+    // six contending batches (a four-deep wait queue at the peak) the in-flight
+    // count reaches exactly 2 - both slots used, never a third - and every load
+    // still completes, so no batch is left waiting while a slot is free. Looped to
+    // surface any queue race the virtual clock would otherwise hide.
+    #[tokio::test(start_paused = true)]
+    async fn concurrency_limit_caps_in_flight_and_queue_drains() {
+        const LIMIT: usize = 2;
+        const BATCHES: u64 = 6;
+        for _ in 0..50 {
+            let (loader, calls, max_in_flight) = limited_loader(LIMIT, Duration::from_secs(10));
+
+            let handles: Vec<_> = (1..=BATCHES).map(|k| spawn_load_on(&loader, k)).collect();
+            for handle in handles {
+                handle.await.expect("task joins").expect("load succeeds");
+            }
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                BATCHES as usize,
+                "every batch reached downstream"
+            );
+            assert_eq!(
+                max_in_flight.load(Ordering::SeqCst),
+                LIMIT,
+                "in-flight peak equals the limit, never exceeds it"
+            );
+        }
+    }
+
+    // Panics on its first downstream call, succeeds on every later one.
+    #[derive(Clone)]
+    struct PanicOnce {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl BatchCollector for PanicOnce {
+        type Input = u64;
+        type Output = u64;
+        type Key = u64;
+        type Error = std::convert::Infallible;
+
+        fn key(&self, input: &u64) -> u64 {
+            *input
+        }
+
+        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Self::Error> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("downstream blew up");
+            }
+            Ok(batch)
+        }
+    }
+
+    // The slot is not stranded when downstream panics. With a single slot, the
+    // panicking batch frees its slot on the unwind, so the next batch acquires it
+    // and completes; the panicking batch's waiter sees Closed (its responder was
+    // dropped). The panic message printed during this test is expected.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_batch_frees_its_slot_for_the_next() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = BatchLoaderConfig {
+            window: Duration::from_secs(3600),
+            max_batch_size: NonZeroUsize::new(1).expect("1 is non-zero"),
+            concurrency_limit: NonZeroUsize::new(1),
+            ..BatchLoaderConfig::default()
+        };
+        let loader = BatchLoader::spawn(
+            PanicOnce {
+                calls: calls.clone(),
+            },
+            config,
+        );
+
+        let first = spawn_load_on(&loader, 1).await.expect("task joins");
+        assert!(
+            matches!(first, Err(Error::Closed)),
+            "the panicking batch cannot serve its waiter"
+        );
+
+        let second = spawn_load_on(&loader, 2)
+            .await
+            .expect("task joins")
+            .expect("load succeeds");
+        assert_eq!(second, 2, "the next batch got the freed slot");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both batches reached downstream"
+        );
+    }
+
+    // Signals when a load enters downstream, then holds the slot for `hold` of
+    // virtual time - lets a test seat one batch in the slot before queuing another.
+    #[derive(Clone)]
+    struct Holder {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<Notify>,
+        hold: Duration,
+    }
+
+    impl BatchCollector for Holder {
+        type Input = u64;
+        type Output = u64;
+        type Key = u64;
+        type Error = std::convert::Infallible;
+
+        fn key(&self, input: &u64) -> u64 {
+            *input
+        }
+
+        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            tokio::time::sleep(self.hold).await;
+            Ok(batch)
+        }
+    }
+
+    // A batch that cannot get a slot within max_waiting is dropped with a wait
+    // error and never reaches downstream. With a single slot held past the limit,
+    // the queued batch times out; the call count proves downstream ran once (the
+    // holder), not for the timed-out batch. Looped to surface any queue race.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_that_waits_past_max_waiting_fails_without_downstream() {
+        for _ in 0..50 {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let entered = Arc::new(Notify::new());
+            let collector = Holder {
+                calls: calls.clone(),
+                entered: entered.clone(),
+                hold: Duration::from_secs(3600),
+            };
+            let config = BatchLoaderConfig {
+                window: Duration::from_secs(3600),
+                max_batch_size: NonZeroUsize::new(1).expect("1 is non-zero"),
+                concurrency_limit: NonZeroUsize::new(1),
+                max_waiting: Some(Duration::from_secs(5)),
+                ..BatchLoaderConfig::default()
+            };
+            let loader = BatchLoader::spawn(collector, config);
+
+            // First batch takes the only slot and holds it well past the limit.
+            let holder = spawn_load_on(&loader, 1);
+            entered.notified().await;
+
+            // Second batch queues for the slot and never gets it within max_waiting.
+            let waited = spawn_load_on(&loader, 2).await.expect("task joins");
+            assert!(
+                matches!(waited, Err(Error::WaitingTimeout)),
+                "the queued batch times out waiting for a slot"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "downstream ran for the holder only, not the timed-out batch"
+            );
+
+            holder.abort();
+        }
+    }
+
+    // max_waiting without a concurrency limit is a soft no-op: loads still run and
+    // succeed, no panic.
+    #[tokio::test(start_paused = true)]
+    async fn max_waiting_without_a_limit_is_a_soft_no_op() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = BatchLoaderConfig {
+            window: Duration::from_secs(3600),
+            max_batch_size: NonZeroUsize::new(1).expect("1 is non-zero"),
+            concurrency_limit: None,
+            max_waiting: Some(Duration::from_secs(5)),
+            ..BatchLoaderConfig::default()
+        };
+        let loader = BatchLoader::spawn(
+            Squares {
+                calls: calls.clone(),
+            },
+            config,
+        );
+
+        let value = spawn_load_on(&loader, 6)
+            .await
+            .expect("task joins")
+            .expect("load succeeds");
+
+        assert_eq!(value, 36);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
