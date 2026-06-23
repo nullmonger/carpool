@@ -45,7 +45,7 @@ impl Slots {
         timeout: Duration,
     ) {
         match self {
-            Slots::Unlimited => dispatch_window(&collector, batch, timeout).await,
+            Slots::Unlimited => dispatch_window(collector, batch, timeout).await,
             Slots::Limited {
                 permits,
                 max_waiting,
@@ -61,7 +61,7 @@ impl Slots {
                         }
                     },
                 };
-                dispatch_window(&collector, batch, timeout).await;
+                dispatch_window(collector, batch, timeout).await;
             }
         }
     }

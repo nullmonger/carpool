@@ -18,7 +18,10 @@ pub enum Error<E> {
     Timeout,
     #[error("timed out waiting for a concurrency slot")]
     WaitingTimeout,
-    // background pipeline shut down (for example a downstream panic tore the dispatcher down)
+    // downstream panic delivered to its waiters instead of leaving them blocked
+    #[error("the collector panicked while loading a batch")]
+    CollectorPanic,
+    // background pipeline shut down (every loader clone dropped, so the channels closed)
     #[error("the batch loader has shut down")]
     Closed,
 }

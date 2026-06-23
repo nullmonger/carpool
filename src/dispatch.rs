@@ -23,7 +23,7 @@ pub(crate) struct Request<C: BatchCollector> {
 // Collapse a closed window into one downstream call and hand each result back to
 // every caller that asked for that key. The call is bound by `timeout`.
 pub(crate) async fn dispatch_window<C: BatchCollector>(
-    collector: &C,
+    collector: C,
     batch: Vec<Request<C>>,
     timeout: Duration,
 ) {
@@ -42,18 +42,35 @@ pub(crate) async fn dispatch_window<C: BatchCollector>(
         inputs.entry(key).or_insert(input);
     }
 
-    match tokio::time::timeout(timeout, collector.load(inputs)).await {
-        // Deadline hit: dropping the load future cancels downstream, so it stops
-        // here; every waiter of the batch shares the timeout error.
-        Err(_elapsed) => deliver_to_all::<C>(waiters, Error::Timeout),
+    // Load on its own task so a downstream panic surfaces as a JoinError here
+    // instead of unwinding the dispatcher; abort it on the deadline (a dropped
+    // JoinHandle only detaches, leaving the work running).
+    let load = tokio::spawn(async move { collector.load(inputs).await });
+    let aborter = load.abort_handle();
+    match tokio::time::timeout(timeout, load).await {
+        // Deadline hit: abort the call (cancels at its next await point) and time out.
+        Err(_elapsed) => {
+            aborter.abort();
+            deliver_to_all::<C>(waiters, Error::Timeout);
+        }
+        // Downstream panicked: turn the JoinError into CollectorPanic for its waiters.
+        Ok(Err(panicked)) => {
+            warn_collector_panicked(&panicked);
+            deliver_to_all::<C>(waiters, Error::CollectorPanic);
+        }
         // Downstream failed: the whole batch shares the same error.
-        Ok(Err(e)) => deliver_to_all::<C>(waiters, Error::Collector(e)),
-        Ok(Ok(mut response)) => {
+        Ok(Ok(Err(e))) => deliver_to_all::<C>(waiters, Error::Collector(e)),
+        Ok(Ok(Ok(mut response))) => {
             // An unknown key in the response is an implementor bug that taints the
             // whole batch and takes precedence over any missing key.
             let unknown = response.keys().filter(|k| !waiters.contains_key(k)).count();
             if unknown > 0 {
-                deliver_to_all::<C>(waiters, Error::ContractViolation { unknown_keys: unknown });
+                deliver_to_all::<C>(
+                    waiters,
+                    Error::ContractViolation {
+                        unknown_keys: unknown,
+                    },
+                );
                 return;
             }
 
@@ -113,6 +130,14 @@ fn warn_if_dropped(delivered: bool) {
 
 #[cfg(not(feature = "tracing"))]
 fn warn_if_dropped(_delivered: bool) {}
+
+#[cfg(feature = "tracing")]
+fn warn_collector_panicked(err: &tokio::task::JoinError) {
+    tracing::warn!("carpool: the collector panicked while loading a batch: {err}");
+}
+
+#[cfg(not(feature = "tracing"))]
+fn warn_collector_panicked(_err: &tokio::task::JoinError) {}
 
 #[cfg(test)]
 mod tests {
@@ -212,7 +237,7 @@ mod tests {
         let (b, rx_b) = req(1, 1);
         let (c, rx_c) = req(2, 2);
 
-        dispatch_window(&collector, vec![a, b, c], NO_TIMEOUT).await;
+        dispatch_window(collector, vec![a, b, c], NO_TIMEOUT).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one downstream call");
         assert_eq!(
@@ -233,7 +258,7 @@ mod tests {
         let (a, rx_a) = req(1, 1);
         let (b, rx_b) = req(2, 2);
 
-        dispatch_window(&collector, vec![a, b], NO_TIMEOUT).await;
+        dispatch_window(collector, vec![a, b], NO_TIMEOUT).await;
 
         assert_eq!(rx_a.await.unwrap().unwrap(), 1);
         assert!(matches!(rx_b.await.unwrap(), Err(Error::MissingOutput)));
@@ -247,7 +272,7 @@ mod tests {
         let (a, rx_a) = req(1, 1);
         let (b, rx_b) = req(2, 2);
 
-        dispatch_window(&collector, vec![a, b], NO_TIMEOUT).await;
+        dispatch_window(collector, vec![a, b], NO_TIMEOUT).await;
 
         assert!(matches!(
             rx_a.await.unwrap(),
@@ -266,7 +291,7 @@ mod tests {
         let (a, rx_a) = req(1, 1);
         let (b, rx_b) = req(2, 2);
 
-        dispatch_window(&collector, vec![a, b], NO_TIMEOUT).await;
+        dispatch_window(collector, vec![a, b], NO_TIMEOUT).await;
 
         assert!(matches!(rx_a.await.unwrap(), Err(Error::Collector(_))));
         assert!(matches!(rx_b.await.unwrap(), Err(Error::Collector(_))));

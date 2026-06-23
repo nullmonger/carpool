@@ -67,8 +67,8 @@ impl<C: BatchCollector> BatchLoader<C> {
         }
         match reply.await {
             Ok(result) => result,
-            // The dispatcher dropped our responder without answering
-            // (a downstream panic can tear it down), so the loader cannot serve.
+            // Responder dropped without an answer: the dispatcher is gone
+            // (every loader clone dropped, channels closed), so we cannot serve.
             Err(_) => Err(Error::Closed),
         }
     }
@@ -80,8 +80,9 @@ async fn run_dispatcher<C: BatchCollector>(
     slots: Slots,
     timeout: Duration,
 ) {
-    // One task per window for parallel batches, capped by Slots. The set surfaces
-    // a batch panic as a warning and drains in-flight batches when the source closes.
+    // One task per window for parallel batches, capped by Slots. The set drains
+    // in-flight batches when the source closes; report_batch is a panic backstop
+    // (downstream panics are handled in dispatch).
     let mut batches = JoinSet::new();
     loop {
         tokio::select! {
@@ -362,42 +363,43 @@ mod tests {
         }
     }
 
-    // The slot is not stranded when downstream panics. With a single slot, the
-    // panicking batch frees its slot on the unwind, so the next batch acquires it
-    // and completes; the panicking batch's waiter sees Closed (its responder was
-    // dropped). The panic message printed during this test is expected.
+    // A downstream panic reaches its waiter as CollectorPanic and frees the slot, so
+    // the next batch runs. Looped on virtual time to surface a race; the printed
+    // panic message is expected.
     #[tokio::test(start_paused = true)]
-    async fn a_panicking_batch_frees_its_slot_for_the_next() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let config = BatchLoaderConfig {
-            window: Duration::from_secs(3600),
-            max_batch_size: NonZeroUsize::new(1).expect("1 is non-zero"),
-            concurrency_limit: NonZeroUsize::new(1),
-            ..BatchLoaderConfig::default()
-        };
-        let loader = BatchLoader::spawn(
-            PanicOnce {
-                calls: calls.clone(),
-            },
-            config,
-        );
+    async fn a_panicking_batch_reports_panic_and_frees_its_slot() {
+        for _ in 0..50 {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let config = BatchLoaderConfig {
+                window: Duration::from_secs(3600),
+                max_batch_size: NonZeroUsize::new(1).expect("1 is non-zero"),
+                concurrency_limit: NonZeroUsize::new(1),
+                ..BatchLoaderConfig::default()
+            };
+            let loader = BatchLoader::spawn(
+                PanicOnce {
+                    calls: calls.clone(),
+                },
+                config,
+            );
 
-        let first = spawn_load_on(&loader, 1).await.expect("task joins");
-        assert!(
-            matches!(first, Err(Error::Closed)),
-            "the panicking batch cannot serve its waiter"
-        );
+            let first = spawn_load_on(&loader, 1).await.expect("task joins");
+            assert!(
+                matches!(first, Err(Error::CollectorPanic)),
+                "the panicking batch reports a panic to its waiter"
+            );
 
-        let second = spawn_load_on(&loader, 2)
-            .await
-            .expect("task joins")
-            .expect("load succeeds");
-        assert_eq!(second, 2, "the next batch got the freed slot");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "both batches reached downstream"
-        );
+            let second = spawn_load_on(&loader, 2)
+                .await
+                .expect("task joins")
+                .expect("load succeeds");
+            assert_eq!(second, 2, "the next batch got the freed slot");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "both batches reached downstream"
+            );
+        }
     }
 
     // Signals when a load enters downstream, then holds the slot for `hold` of
