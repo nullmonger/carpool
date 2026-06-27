@@ -38,8 +38,18 @@ pub(crate) async fn dispatch_window<C: BatchCollector>(
         respond,
     } in batch
     {
+        // Waiter gone before the window closed (its load future was dropped):
+        // leave it out, so a key with no live waiter never reaches downstream.
+        if respond.is_closed() {
+            continue;
+        }
         waiters.entry(key.clone()).or_default().push(respond);
         inputs.entry(key).or_insert(input);
+    }
+
+    // Whole window abandoned before it closed: nothing to serve, skip downstream.
+    if waiters.is_empty() {
+        return;
     }
 
     // Load on its own task so a downstream panic surfaces as a JoinError here
@@ -295,5 +305,62 @@ mod tests {
 
         assert!(matches!(rx_a.await.unwrap(), Err(Error::Collector(_))));
         assert!(matches!(rx_b.await.unwrap(), Err(Error::Collector(_))));
+    }
+
+    // A waiter gone before the window closed drops its key from the batch:
+    // only keys with a live waiter reach downstream.
+    #[tokio::test]
+    async fn abandoned_key_is_not_sent_downstream() {
+        let (collector, calls, batch_len) = collector(Behavior::Square);
+        let (a, rx_a) = req(1, 1);
+        let (b, rx_b) = req(2, 2);
+        drop(rx_a); // key 1's caller cancelled
+
+        dispatch_window(collector, vec![a, b], NO_TIMEOUT).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            batch_len.load(Ordering::SeqCst),
+            1,
+            "only the live key reaches downstream"
+        );
+        assert_eq!(rx_b.await.unwrap().unwrap(), 4);
+    }
+
+    // Every waiter gone before the window closed: downstream is never called.
+    #[tokio::test]
+    async fn all_waiters_gone_skips_downstream() {
+        let (collector, calls, _len) = collector(Behavior::Square);
+        let (a, rx_a) = req(1, 1);
+        let (b, rx_b) = req(2, 2);
+        drop(rx_a);
+        drop(rx_b);
+
+        dispatch_window(collector, vec![a, b], NO_TIMEOUT).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no live waiter -> downstream skipped"
+        );
+    }
+
+    // One of two waiters sharing a key cancels; the key keeps its survivor
+    // and still gets its value, in one downstream call.
+    #[tokio::test]
+    async fn a_dropped_waiter_does_not_starve_its_keys_survivor() {
+        let (collector, calls, _len) = collector(Behavior::Square);
+        let (a, rx_a) = req(1, 1);
+        let (b, rx_b) = req(1, 1); // same key
+        drop(rx_a);
+
+        dispatch_window(collector, vec![a, b], NO_TIMEOUT).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rx_b.await.unwrap().unwrap(),
+            1,
+            "the surviving waiter still gets its value"
+        );
     }
 }

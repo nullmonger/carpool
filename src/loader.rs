@@ -563,4 +563,146 @@ mod tests {
             );
         }
     }
+
+    // Cancelling one waiter mid-flight must not cancel downstream or strand the slot:
+    // the abandoned batch still runs, its result is discarded without a panic,
+    // and the freed slot serves the next batch. Looped on virtual time for races.
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_one_load_leaves_the_others_and_the_slot_clean() {
+        const HOLD: Duration = Duration::from_secs(10);
+        for _ in 0..50 {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let entered = Arc::new(Notify::new());
+            let config = BatchLoaderConfig {
+                window: Duration::from_secs(3600),
+                max_batch_size: NonZeroUsize::new(1).expect("1 is non-zero"),
+                concurrency_limit: NonZeroUsize::new(1),
+                ..BatchLoaderConfig::default()
+            };
+            let loader = BatchLoader::spawn(
+                Holder {
+                    calls: calls.clone(),
+                    entered: entered.clone(),
+                    hold: HOLD,
+                },
+                config,
+            );
+
+            // First batch enters downstream and holds the only slot.
+            let h1 = spawn_load_on(&loader, 1);
+            entered.notified().await;
+
+            // Cancel its waiter: downstream is not aborted, the result is discarded.
+            h1.abort();
+            assert!(h1.await.unwrap_err().is_cancelled());
+
+            // Finishing the abandoned batch must not panic on its dropped receiver;
+            // the freed slot then serves the next batch.
+            tokio::time::advance(HOLD).await;
+            let h2 = spawn_load_on(&loader, 2);
+            entered.notified().await;
+            tokio::time::advance(HOLD).await;
+            let value = h2.await.expect("task joins").expect("load succeeds");
+
+            assert_eq!(value, 2, "the next batch got the freed slot");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "downstream ran for both - the cancelled batch was not aborted"
+            );
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct Boom;
+
+    impl std::fmt::Display for Boom {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("boom")
+        }
+    }
+
+    impl std::error::Error for Boom {}
+
+    // How MisbehaveOnce breaks its first call:
+    // a downstream error or a contract violation (an unknown key in the response).
+    #[derive(Clone, Copy)]
+    enum Misbehavior {
+        Error,
+        Contract,
+    }
+
+    // Breaks its first downstream call the chosen way, then returns identity.
+    #[derive(Clone)]
+    struct MisbehaveOnce {
+        calls: Arc<AtomicUsize>,
+        how: Misbehavior,
+    }
+
+    impl BatchCollector for MisbehaveOnce {
+        type Input = u64;
+        type Output = u64;
+        type Key = u64;
+        type Error = Boom;
+
+        fn key(&self, input: &u64) -> u64 {
+            *input
+        }
+
+        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Boom> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                match self.how {
+                    Misbehavior::Error => return Err(Boom),
+                    Misbehavior::Contract => {
+                        let mut out = batch;
+                        out.insert(u64::MAX, 0); // key never requested -> ContractViolation
+                        return Ok(out);
+                    }
+                }
+            }
+            Ok(batch)
+        }
+    }
+
+    // The error and contract paths free the slot like every other return:
+    // after either failure the next batch reaches downstream and succeeds.
+    // Contract has its own early return, so it is exercised explicitly.
+    #[tokio::test(start_paused = true)]
+    async fn failure_paths_free_the_slot_for_the_next() {
+        for how in [Misbehavior::Error, Misbehavior::Contract] {
+            for _ in 0..50 {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let config = BatchLoaderConfig {
+                    window: Duration::from_secs(3600),
+                    max_batch_size: NonZeroUsize::new(1).expect("1 is non-zero"),
+                    concurrency_limit: NonZeroUsize::new(1),
+                    ..BatchLoaderConfig::default()
+                };
+                let loader = BatchLoader::spawn(
+                    MisbehaveOnce {
+                        calls: calls.clone(),
+                        how,
+                    },
+                    config,
+                );
+
+                let failed = spawn_load_on(&loader, 1).await.expect("task joins");
+                match how {
+                    Misbehavior::Error => {
+                        assert!(matches!(failed, Err(Error::Collector(_))));
+                    }
+                    Misbehavior::Contract => {
+                        assert!(matches!(failed, Err(Error::ContractViolation { .. })));
+                    }
+                }
+
+                let next = spawn_load_on(&loader, 2)
+                    .await
+                    .expect("task joins")
+                    .expect("load succeeds");
+                assert_eq!(next, 2, "the next batch got the freed slot");
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
 }
