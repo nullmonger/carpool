@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use crate::collector::BatchCollector;
-use crate::config::BatchLoaderConfig;
+use crate::config::BatchConfig;
 use crate::dispatch::{Request, dispatch_window, fail_batch};
 use crate::error::Error;
 
@@ -19,7 +19,7 @@ pub(crate) enum Slots {
 }
 
 impl Slots {
-    pub(crate) fn from_config(config: &BatchLoaderConfig) -> Self {
+    pub(crate) fn from_config(config: &BatchConfig) -> Self {
         match config.concurrency_limit {
             // clamp so a huge limit degrades instead of panicking in Semaphore::new
             Some(limit) => Slots::Limited {

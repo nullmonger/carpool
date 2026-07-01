@@ -3,7 +3,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct BatchLoaderConfig {
+pub struct BatchConfig {
     pub window: Duration,
     pub max_batch_size: NonZeroUsize,
     pub timeout: Duration,
@@ -12,7 +12,7 @@ pub struct BatchLoaderConfig {
     pub max_waiting: Option<Duration>,
 }
 
-impl Default for BatchLoaderConfig {
+impl Default for BatchConfig {
     fn default() -> Self {
         Self {
             window: Duration::from_millis(30),
@@ -30,7 +30,7 @@ mod tests {
 
     #[test]
     fn default_config_matches_documented_values() {
-        let cfg = BatchLoaderConfig::default();
+        let cfg = BatchConfig::default();
 
         assert_eq!(cfg.window, Duration::from_millis(30));
         assert_eq!(cfg.max_batch_size.get(), 1024);

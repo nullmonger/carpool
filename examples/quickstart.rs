@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use carpool::{BatchCollector, BatchLoaderConfig};
+use carpool::{BatchCollector, BatchConfig};
 
 #[derive(Clone)]
 struct SquareLoader;
@@ -28,7 +28,7 @@ impl BatchCollector for SquareLoader {
 }
 
 fn main() {
-    let cfg = BatchLoaderConfig::default();
+    let cfg = BatchConfig::default();
     println!(
         "config: window={:?} max_batch={} timeout={:?} concurrency={:?} max_waiting={:?}",
         cfg.window,

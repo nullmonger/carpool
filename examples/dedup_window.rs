@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use carpool::{BatchCollector, BatchLoader, BatchLoaderConfig};
+use carpool::{BatchCollector, BatchConfig, Batcher};
 
 // Records how many times it is actually called, so dedup shows up as an
 // observable fact, not just as equal results. Output depends on the key alone,
@@ -33,11 +33,11 @@ impl BatchCollector for CountingSquares {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let loader = BatchLoader::spawn(
+    let loader = Batcher::spawn(
         CountingSquares {
             calls: calls.clone(),
         },
-        BatchLoaderConfig::default(),
+        BatchConfig::default(),
     );
 
     // A hundred concurrent loads, but only four distinct keys.
