@@ -2,9 +2,19 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
 
+use thiserror::Error;
 use tokio::sync::oneshot;
 
-use crate::fetcher::{DedupError, Fetcher};
+use crate::fetcher::Fetcher;
+
+#[derive(Debug, Clone, Error)]
+#[non_exhaustive]
+pub enum DedupError<E> {
+    #[error("fetch failed: {0}")]
+    Load(#[source] E),
+    #[error("the fetcher panicked while loading")]
+    Panic,
+}
 
 // Aliased to keep the nested generics under clippy's type-complexity lint.
 type Responder<F> =
@@ -58,14 +68,15 @@ impl<F: Fetcher> Deduplicator<F> {
 
         match reply.await {
             Ok(result) => result,
-            // Sender gone without a reply: run_fetch died abnormally, report don't hang.
+            // Sender gone without a reply: run_fetch died abnormally, report instead of hanging.
             Err(_) => Err(DedupError::Panic),
         }
     }
 }
 
-// A load panic becomes a JoinError (never a hung waiter); assumes the input's
-// Clone/Hash/Eq do not panic.
+// A load panic becomes a JoinError (never a hung waiter).
+// The Fetcher and Input trait impls (Clone, Hash, Eq) run outside that isolation:
+// they must not panic, or the entry orphans and this input's later callers hang.
 async fn run_fetch<F: Fetcher>(fetcher: F, in_flight: InFlight<F>, input: F::Input) {
     let key = input.clone();
     let outcome = tokio::spawn(async move { fetcher.load(input).await }).await;
@@ -254,8 +265,8 @@ mod tests {
         }
     }
 
-    // A fetch panic reaches all callers as DedupError::Panic and frees the input, 
-    // so the next call refetches. Looped on virtual time for the cleanup race; 
+    // A fetch panic reaches all callers as DedupError::Panic and frees the input,
+    // so the next call refetches. Looped on virtual time for the cleanup race;
     // the printed panic is expected.
     #[tokio::test(start_paused = true)]
     async fn a_fetch_panic_reaches_callers_and_frees_the_input() {
@@ -324,7 +335,7 @@ mod tests {
         (fetcher, calls, completed, entered, finished)
     }
 
-    // The initiator's wait times out, but the started fetch is not cancelled: 
+    // The initiator's wait times out, but the started fetch is not cancelled:
     // the follower still gets the value and the fetch ran once. Auto-advance drives the clock.
     #[tokio::test(start_paused = true)]
     async fn abandoning_the_initiator_does_not_cancel_the_fetch() {
@@ -348,7 +359,7 @@ mod tests {
         }
     }
 
-    // All waiters leave after the fetch started: it still runs to completion, 
+    // All waiters leave after the fetch started: it still runs to completion,
     // and delivery into the closed receiver does not panic.
     #[tokio::test(start_paused = true)]
     async fn all_waiters_leaving_does_not_cancel_the_started_fetch() {
@@ -364,7 +375,7 @@ mod tests {
             entered.notified().await;
 
             caller.abort();
-            let _ = caller.await;
+            assert!(caller.await.unwrap_err().is_cancelled());
 
             tokio::time::advance(HOLD).await;
             finished.notified().await;
@@ -375,6 +386,29 @@ mod tests {
                 1,
                 "the fetch finished with no waiter left, without panicking"
             );
+        }
+    }
+
+    // One of several waiters for an input departs; the rest still get the value
+    // from the single shared fetch, and delivery into the departed receiver does
+    // not panic. Auto-advance drives the virtual clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_departed_waiter_does_not_starve_the_others() {
+        const HOLD: Duration = Duration::from_secs(10);
+        const SHORT: Duration = Duration::from_secs(1);
+        for _ in 0..50 {
+            let (fetcher, calls, _completed, _entered, _finished) = slow(HOLD);
+            let d = Deduplicator::new(fetcher);
+
+            let departing = tokio::time::timeout(SHORT, d.call(1));
+            let survivor_a = d.call(1);
+            let survivor_b = d.call(1);
+            let (gone, a, b) = tokio::join!(departing, survivor_a, survivor_b);
+
+            assert!(gone.is_err(), "one waiter timed out and departed");
+            assert_eq!(a.unwrap(), 1, "a surviving waiter still gets the value");
+            assert_eq!(b.unwrap(), 1, "the other survivor too");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "one shared fetch for all");
         }
     }
 }

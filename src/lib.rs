@@ -12,7 +12,7 @@ mod window;
 
 pub use collector::BatchCollector;
 pub use config::BatchLoaderConfig;
-pub use deduplicator::Deduplicator;
+pub use deduplicator::{DedupError, Deduplicator};
 pub use error::Error;
-pub use fetcher::{DedupError, Fetcher};
+pub use fetcher::Fetcher;
 pub use loader::BatchLoader;
