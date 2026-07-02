@@ -1,13 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use carpool::{BatchCollector, BatchConfig, Batcher};
 
-// Records how many times it is actually called, so dedup shows up as an
-// observable fact, not just as equal results. Output depends on the key alone,
-// so it does not matter which duplicate became the batch representative.
+// Counts downstream calls, so dedup is visible in the number of calls,
+// not only in equal results.
 #[derive(Clone)]
 struct CountingSquares {
     calls: Arc<AtomicUsize>,
@@ -16,35 +15,29 @@ struct CountingSquares {
 impl BatchCollector for CountingSquares {
     type Input = u64;
     type Output = u64;
-    type Key = u64;
     type Error = Infallible;
 
-    // Fold many inputs onto four keys so duplicates dominate the window.
-    fn key(&self, input: &u64) -> u64 {
-        *input % 4
-    }
-
-    async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Infallible> {
+    async fn load(&self, batch: HashSet<u64>) -> Result<HashMap<u64, u64>, Infallible> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(batch.into_keys().map(|k| (k, k * k)).collect())
+        Ok(batch.into_iter().map(|n| (n, n * n)).collect())
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let loader = Batcher::spawn(
+    let batcher = Batcher::spawn(
         CountingSquares {
             calls: calls.clone(),
         },
         BatchConfig::default(),
     );
 
-    // A hundred concurrent loads, but only four distinct keys.
+    // A hundred concurrent loads over only four distinct inputs (i % 4).
     let handles: Vec<_> = (0..100u64)
         .map(|i| {
-            let loader = loader.clone();
-            tokio::spawn(async move { loader.load(i).await })
+            let batcher = batcher.clone();
+            tokio::spawn(async move { batcher.load(i % 4).await })
         })
         .collect();
 
@@ -55,19 +48,23 @@ async fn main() {
 
     let downstream_calls = calls.load(Ordering::SeqCst);
     println!("loads:            {}", results.len());
-    println!("distinct keys:    4");
+    println!("distinct inputs:  4");
     println!("downstream calls: {downstream_calls}");
 
     // The invariant, not the line order: one call served the whole window, and
-    // every load got the square of its key.
+    // every load got the square of its input.
     assert_eq!(results.len(), 100);
     assert_eq!(
         downstream_calls, 1,
-        "100 loads over 4 keys collapse to one downstream call"
+        "100 loads over 4 distinct inputs collapse to one downstream call"
     );
     for (i, result) in results.iter().enumerate() {
-        let key = i as u64 % 4;
-        assert_eq!(*result, key * key, "each load gets the square of its key");
+        let input = i as u64 % 4;
+        assert_eq!(
+            *result,
+            input * input,
+            "each load gets the square of its input"
+        );
     }
 
     println!("dedup confirmed: 100 loads served by {downstream_calls} downstream call");

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -11,46 +11,37 @@ use crate::error::Error;
 type Responder<C> =
     oneshot::Sender<Result<<C as BatchCollector>::Output, Error<<C as BatchCollector>::Error>>>;
 
-// One queued load: its key, the input to fold into the batch, and the one-shot
-// channel that carries the result back to the waiting caller. Stays internal -
-// the oneshot never appears in the public `load` signature.
+// One queued load: the input to fold into the batch plus its one-shot reply channel.
+// Internal - the oneshot never appears in the public `load` signature.
 pub(crate) struct Request<C: BatchCollector> {
-    pub(crate) key: C::Key,
     pub(crate) input: C::Input,
     pub(crate) respond: Responder<C>,
 }
 
-// Collapse a closed window into one downstream call and hand each result back to
-// every caller that asked for that key. The call is bound by `timeout`.
+// Collapse a closed window into one downstream call, bound by `timeout`;
+// hand each result back to every caller that asked for that input.
 pub(crate) async fn dispatch_window<C: BatchCollector>(
     collector: C,
     batch: Vec<Request<C>>,
     timeout: Duration,
 ) {
-    // Dedup: one representative input per key for downstream, and every waiter
-    // grouped under its key so the result reaches all of them. Addressing is by
-    // key, never by position - inputs sharing a key are interchangeable.
-    let mut inputs: HashMap<C::Key, C::Input> = HashMap::new();
-    let mut waiters: HashMap<C::Key, Vec<Responder<C>>> = HashMap::new();
-    for Request {
-        key,
-        input,
-        respond,
-    } in batch
-    {
-        // Waiter gone before the window closed (its load future was dropped):
-        // leave it out, so a key with no live waiter never reaches downstream.
+    // Group waiters by input: equal inputs collapse to one downstream entry
+    // and share the result. A dropped waiter is skipped,
+    // so an input with no live waiter never reaches downstream.
+    let mut waiters: HashMap<C::Input, Vec<Responder<C>>> = HashMap::new();
+    for Request { input, respond } in batch {
         if respond.is_closed() {
             continue;
         }
-        waiters.entry(key.clone()).or_default().push(respond);
-        inputs.entry(key).or_insert(input);
+        waiters.entry(input).or_default().push(respond);
     }
 
     // Whole window abandoned before it closed: nothing to serve, skip downstream.
     if waiters.is_empty() {
         return;
     }
+
+    let inputs: HashSet<C::Input> = waiters.keys().cloned().collect();
 
     // Load on its own task so a downstream panic surfaces as a JoinError here
     // instead of unwinding the dispatcher; abort it on the deadline (a dropped
@@ -71,28 +62,28 @@ pub(crate) async fn dispatch_window<C: BatchCollector>(
         // Downstream failed: the whole batch shares the same error.
         Ok(Ok(Err(e))) => deliver_to_all::<C>(waiters, Error::Collector(e)),
         Ok(Ok(Ok(mut response))) => {
-            // An unknown key in the response is an implementor bug that taints the
-            // whole batch and takes precedence over any missing key.
+            // An unknown input in the response taints the whole batch (implementor bug)
+            // and takes precedence over any missing input.
             let unknown = response.keys().filter(|k| !waiters.contains_key(k)).count();
             if unknown > 0 {
                 deliver_to_all::<C>(
                     waiters,
                     Error::ContractViolation {
-                        unknown_keys: unknown,
+                        unknown_inputs: unknown,
                     },
                 );
                 return;
             }
 
-            for (key, senders) in waiters {
-                match response.remove(&key) {
+            for (input, senders) in waiters {
+                match response.remove(&input) {
                     // Fan-out: each waiter gets its own clone of the shared value.
                     Some(value) => {
                         for respond in senders {
                             deliver::<C>(respond, Ok(value.clone()));
                         }
                     }
-                    // Requested key absent: only its waiters get the addressed error.
+                    // Requested input absent: only its waiters get the addressed error.
                     None => {
                         for respond in senders {
                             deliver::<C>(respond, Err(Error::MissingOutput));
@@ -111,7 +102,7 @@ fn deliver<C: BatchCollector>(respond: Responder<C>, result: Result<C::Output, E
 
 // Hand the same error to every waiter of a batch.
 fn deliver_to_all<C: BatchCollector>(
-    waiters: HashMap<C::Key, Vec<Responder<C>>>,
+    waiters: HashMap<C::Input, Vec<Responder<C>>>,
     error: Error<C::Error>,
 ) {
     for senders in waiters.into_values() {
@@ -174,7 +165,7 @@ mod tests {
     #[derive(Clone)]
     enum Behavior {
         Square,
-        OmitKey(u64),
+        OmitInput(u64),
         InjectUnknown(u64),
         Fail,
     }
@@ -189,20 +180,15 @@ mod tests {
     impl BatchCollector for TestCollector {
         type Input = u64;
         type Output = u64;
-        type Key = u64;
         type Error = TestError;
 
-        fn key(&self, input: &u64) -> u64 {
-            *input
-        }
-
-        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, TestError> {
+        async fn load(&self, batch: HashSet<u64>) -> Result<HashMap<u64, u64>, TestError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.batch_len.store(batch.len(), Ordering::SeqCst);
-            let squared = || batch.iter().map(|(k, v)| (*k, v * v));
+            let squared = || batch.iter().map(|&x| (x, x * x));
             match self.behavior {
                 Behavior::Square => Ok(squared().collect()),
-                Behavior::OmitKey(drop) => Ok(squared().filter(|(k, _)| *k != drop).collect()),
+                Behavior::OmitInput(drop) => Ok(squared().filter(|(x, _)| *x != drop).collect()),
                 Behavior::InjectUnknown(extra) => {
                     let mut out: HashMap<u64, u64> = squared().collect();
                     out.insert(extra, 0);
@@ -215,16 +201,9 @@ mod tests {
 
     type Reply = oneshot::Receiver<Result<u64, Error<TestError>>>;
 
-    fn req(key: u64, input: u64) -> (Request<TestCollector>, Reply) {
+    fn req(input: u64) -> (Request<TestCollector>, Reply) {
         let (tx, rx) = oneshot::channel();
-        (
-            Request {
-                key,
-                input,
-                respond: tx,
-            },
-            rx,
-        )
+        (Request { input, respond: tx }, rx)
     }
 
     fn collector(behavior: Behavior) -> (TestCollector, Arc<AtomicUsize>, Arc<AtomicUsize>) {
@@ -238,14 +217,12 @@ mod tests {
         (collector, calls, batch_len)
     }
 
-    // Dedup: duplicate keys collapse to one downstream input and one call; both
-    // waiters of a key receive the shared value.
     #[tokio::test]
-    async fn duplicate_keys_collapse_to_one_input_per_key() {
+    async fn duplicate_inputs_collapse_to_one_downstream_entry() {
         let (collector, calls, batch_len) = collector(Behavior::Square);
-        let (a, rx_a) = req(1, 1);
-        let (b, rx_b) = req(1, 1);
-        let (c, rx_c) = req(2, 2);
+        let (a, rx_a) = req(1);
+        let (b, rx_b) = req(1);
+        let (c, rx_c) = req(2);
 
         dispatch_window(collector, vec![a, b, c], NO_TIMEOUT).await;
 
@@ -253,20 +230,18 @@ mod tests {
         assert_eq!(
             batch_len.load(Ordering::SeqCst),
             2,
-            "three requests, two unique keys"
+            "three requests, two unique inputs"
         );
         assert_eq!(rx_a.await.unwrap().unwrap(), 1);
         assert_eq!(rx_b.await.unwrap().unwrap(), 1);
         assert_eq!(rx_c.await.unwrap().unwrap(), 4);
     }
 
-    // Absent requested key: only its waiter gets the addressed MissingOutput,
-    // the others still get their values.
     #[tokio::test]
-    async fn missing_key_is_addressed_only_to_its_waiter() {
-        let (collector, _calls, _len) = collector(Behavior::OmitKey(2));
-        let (a, rx_a) = req(1, 1);
-        let (b, rx_b) = req(2, 2);
+    async fn missing_input_is_addressed_only_to_its_waiter() {
+        let (collector, _calls, _len) = collector(Behavior::OmitInput(2));
+        let (a, rx_a) = req(1);
+        let (b, rx_b) = req(2);
 
         dispatch_window(collector, vec![a, b], NO_TIMEOUT).await;
 
@@ -274,32 +249,30 @@ mod tests {
         assert!(matches!(rx_b.await.unwrap(), Err(Error::MissingOutput)));
     }
 
-    // Unknown key in the response fails the whole batch, even the waiters whose
-    // keys were answered correctly.
+    // The unknown input taints the whole batch, so rx_a fails despite a correct answer.
     #[tokio::test]
-    async fn unknown_key_fails_the_whole_batch() {
+    async fn unknown_input_fails_the_whole_batch() {
         let (collector, _calls, _len) = collector(Behavior::InjectUnknown(99));
-        let (a, rx_a) = req(1, 1);
-        let (b, rx_b) = req(2, 2);
+        let (a, rx_a) = req(1);
+        let (b, rx_b) = req(2);
 
         dispatch_window(collector, vec![a, b], NO_TIMEOUT).await;
 
         assert!(matches!(
             rx_a.await.unwrap(),
-            Err(Error::ContractViolation { unknown_keys: 1 })
+            Err(Error::ContractViolation { unknown_inputs: 1 })
         ));
         assert!(matches!(
             rx_b.await.unwrap(),
-            Err(Error::ContractViolation { unknown_keys: 1 })
+            Err(Error::ContractViolation { unknown_inputs: 1 })
         ));
     }
 
-    // Downstream error reaches every waiter in the batch.
     #[tokio::test]
     async fn collector_error_reaches_every_waiter() {
         let (collector, _calls, _len) = collector(Behavior::Fail);
-        let (a, rx_a) = req(1, 1);
-        let (b, rx_b) = req(2, 2);
+        let (a, rx_a) = req(1);
+        let (b, rx_b) = req(2);
 
         dispatch_window(collector, vec![a, b], NO_TIMEOUT).await;
 
@@ -307,14 +280,12 @@ mod tests {
         assert!(matches!(rx_b.await.unwrap(), Err(Error::Collector(_))));
     }
 
-    // A waiter gone before the window closed drops its key from the batch:
-    // only keys with a live waiter reach downstream.
     #[tokio::test]
-    async fn abandoned_key_is_not_sent_downstream() {
+    async fn abandoned_input_is_not_sent_downstream() {
         let (collector, calls, batch_len) = collector(Behavior::Square);
-        let (a, rx_a) = req(1, 1);
-        let (b, rx_b) = req(2, 2);
-        drop(rx_a); // key 1's caller cancelled
+        let (a, rx_a) = req(1);
+        let (b, rx_b) = req(2);
+        drop(rx_a); // input 1's caller cancelled
 
         dispatch_window(collector, vec![a, b], NO_TIMEOUT).await;
 
@@ -322,17 +293,16 @@ mod tests {
         assert_eq!(
             batch_len.load(Ordering::SeqCst),
             1,
-            "only the live key reaches downstream"
+            "only the live input reaches downstream"
         );
         assert_eq!(rx_b.await.unwrap().unwrap(), 4);
     }
 
-    // Every waiter gone before the window closed: downstream is never called.
     #[tokio::test]
     async fn all_waiters_gone_skips_downstream() {
         let (collector, calls, _len) = collector(Behavior::Square);
-        let (a, rx_a) = req(1, 1);
-        let (b, rx_b) = req(2, 2);
+        let (a, rx_a) = req(1);
+        let (b, rx_b) = req(2);
         drop(rx_a);
         drop(rx_b);
 
@@ -345,13 +315,11 @@ mod tests {
         );
     }
 
-    // One of two waiters sharing a key cancels; the key keeps its survivor
-    // and still gets its value, in one downstream call.
     #[tokio::test]
-    async fn a_dropped_waiter_does_not_starve_its_keys_survivor() {
+    async fn a_dropped_waiter_does_not_starve_its_inputs_survivor() {
         let (collector, calls, _len) = collector(Behavior::Square);
-        let (a, rx_a) = req(1, 1);
-        let (b, rx_b) = req(1, 1); // same key
+        let (a, rx_a) = req(1);
+        let (b, rx_b) = req(1); // same input
         drop(rx_a);
 
         dispatch_window(collector, vec![a, b], NO_TIMEOUT).await;

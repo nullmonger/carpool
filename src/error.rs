@@ -6,13 +6,13 @@ pub enum Error<E> {
     // #[source], not #[from]: #[from] would generate From<E> and clash for a generic E
     #[error("collector failed: {0}")]
     Collector(#[source] E),
-    // implementor bug: response key not in the batch - fails the whole batch
+    // implementor bug: response input not in the batch - fails the whole batch
     #[error(
-        "collector broke the key-addressed contract: {unknown_keys} unknown key(s) in the response"
+        "collector broke the input-addressed contract: {unknown_inputs} unknown input(s) in the response"
     )]
-    ContractViolation { unknown_keys: usize },
-    // implementor bug: no output for a requested key - not a domain "not found"
-    #[error("collector returned no output for a requested key")]
+    ContractViolation { unknown_inputs: usize },
+    // implementor bug: no output for a requested input - not a domain "not found"
+    #[error("collector returned no output for a requested input")]
     MissingOutput,
     #[error("batch timed out")]
     Timeout,
@@ -21,8 +21,8 @@ pub enum Error<E> {
     // downstream panic delivered to its waiters instead of leaving them blocked
     #[error("the collector panicked while loading a batch")]
     CollectorPanic,
-    // background pipeline shut down (every loader clone dropped, so the channels closed)
-    #[error("the batch loader has shut down")]
+    // background pipeline shut down (every batcher clone dropped, so the channels closed)
+    #[error("the batcher has shut down")]
     Closed,
 }
 
@@ -54,17 +54,17 @@ mod tests {
     #[test]
     fn contract_bug_variants_have_no_source_and_render() {
         let missing: Error<DownstreamError> = Error::MissingOutput;
-        let violation: Error<DownstreamError> = Error::ContractViolation { unknown_keys: 2 };
+        let violation: Error<DownstreamError> = Error::ContractViolation { unknown_inputs: 2 };
 
         assert!(std::error::Error::source(&missing).is_none());
         assert!(std::error::Error::source(&violation).is_none());
         assert_eq!(
             missing.to_string(),
-            "collector returned no output for a requested key"
+            "collector returned no output for a requested input"
         );
         assert_eq!(
             violation.to_string(),
-            "collector broke the key-addressed contract: 2 unknown key(s) in the response"
+            "collector broke the input-addressed contract: 2 unknown input(s) in the response"
         );
     }
 }

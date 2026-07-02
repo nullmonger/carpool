@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::time::Duration;
@@ -5,43 +7,52 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 
-// Collection window: the first item opens a window and arms a `window`-long
-// timer; the window closes on whichever comes first - `max_batch_size` items or
-// the timer firing - and the next item opens a fresh one.
+// Collection window: the first item opens a window and arms a `window`-long timer.
+// It closes on whichever comes first - `max_batch_size` distinct keys or the timer -
+// and the next item opens a fresh one. Duplicate keys join the open window
+// without advancing the count, so `max_batch_size` bounds the distinct keys downstream,
+// not the raw item count.
 //
 // The boundary rule lives in one place: the select! is `biased` with the timer
 // first, so when an item and the timer are ready together the timer wins - the
 // window closes and the item stays in the channel for the next one, never lost
 // and never duplicated.
 //
-// `collect` batches opaque `T` by time and size only and spawns no task: both
-// channel-close paths are normal teardown, not errors (inbound closed - source
-// gone, flush and stop; outbound closed - consumer gone, stop).
-pub(crate) async fn collect<T>(
+// Spawns no task: both channel-close paths are normal teardown, not errors (inbound
+// closed - source gone, flush and stop; outbound closed - consumer gone, stop).
+pub(crate) async fn collect<T, K, F>(
     mut inbound: mpsc::Receiver<T>,
     outbound: mpsc::Sender<Vec<T>>,
     window: Duration,
     max_batch_size: NonZeroUsize,
-) {
+    key: F,
+) where
+    K: Hash + Eq,
+    F: Fn(&T) -> K,
+{
     let max = max_batch_size.get();
 
-    // No active window: block until the first item opens one.
     while let Some(first) = inbound.recv().await {
+        let mut seen = HashSet::with_capacity(max);
+        seen.insert(key(&first));
         let mut buffer = Vec::with_capacity(max);
         buffer.push(first);
 
         let mut timer = pin!(time::sleep_until(Instant::now() + window));
         let mut inbound_open = true;
 
-        // Window open: fill toward max_batch_size or until the timer fires.
-        // The buffer is owned across select!, so a cancelled branch never drops
-        // an accepted item - the cancel-safety the later tasks rely on.
-        while buffer.len() < max {
+        // Fill toward max_batch_size distinct keys or until the timer fires. The
+        // buffer is owned across select!, so a cancelled branch never drops an
+        // accepted item - the cancel-safety the later tasks rely on.
+        while seen.len() < max {
             tokio::select! {
                 biased;
                 () = timer.as_mut() => break,
                 maybe = inbound.recv() => match maybe {
-                    Some(input) => buffer.push(input),
+                    Some(item) => {
+                        seen.insert(key(&item));
+                        buffer.push(item);
+                    }
                     None => {
                         inbound_open = false;
                         break;
@@ -64,11 +75,14 @@ mod tests {
 
     const WINDOW: Duration = Duration::from_millis(30);
 
-    fn spawn_window<T: Send + 'static>(max: usize) -> (mpsc::Sender<T>, mpsc::Receiver<Vec<T>>) {
+    // Test items are their own dedup key, so the projection is identity.
+    fn spawn_window<T: Copy + Hash + Eq + Send + 'static>(
+        max: usize,
+    ) -> (mpsc::Sender<T>, mpsc::Receiver<Vec<T>>) {
         let (in_tx, in_rx) = mpsc::channel::<T>(64);
         let (out_tx, out_rx) = mpsc::channel::<Vec<T>>(64);
         let max = NonZeroUsize::new(max).expect("max is non-zero");
-        tokio::spawn(collect(in_rx, out_tx, WINDOW, max));
+        tokio::spawn(collect(in_rx, out_tx, WINDOW, max, |x| *x));
         (in_tx, out_rx)
     }
 
@@ -85,6 +99,19 @@ mod tests {
 
         time::advance(WINDOW).await;
         assert_eq!(batches.recv().await.expect("second batch"), vec![4]);
+    }
+
+    // Distinct-key count, not raw count: three copies of one input stay at one
+    // distinct key, so max = 2 never closes by size - the timer carries all three.
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_inputs_do_not_close_the_window_by_size() {
+        let (tx, mut batches) = spawn_window::<u32>(2);
+        for _ in 0..3 {
+            tx.send(7).await.expect("send");
+        }
+
+        time::advance(WINDOW).await;
+        assert_eq!(batches.recv().await.expect("batch"), vec![7, 7, 7]);
     }
 
     // Close-by-timer with a single underfilled item: the window must close on

@@ -1,11 +1,11 @@
-// Smoke demo: implement BatchCollector, read the default config,
-// see that equal inputs map to the same key.
+// Smoke demo: implement BatchCollector, read the default config, and load a batch
+// where equal inputs are one entry - the input is its own dedup identity.
 // Run: cargo run --example quickstart
 // Expected output:
 //   config: window=30ms max_batch=1024 timeout=30s concurrency=None max_waiting=None
-//   key(7) = 7, key(7) = 7 -> equal inputs share one batch entry
+//   batch of three 7s -> 1 entry: 7*7 = 49
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use carpool::{BatchCollector, BatchConfig};
 
@@ -15,19 +15,15 @@ struct SquareLoader;
 impl BatchCollector for SquareLoader {
     type Input = u64;
     type Output = u64;
-    type Key = u64;
     type Error = std::convert::Infallible;
 
-    fn key(&self, input: &u64) -> u64 {
-        *input
-    }
-
-    async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Self::Error> {
-        Ok(batch.into_iter().map(|(k, n)| (k, n * n)).collect())
+    async fn load(&self, batch: HashSet<u64>) -> Result<HashMap<u64, u64>, Self::Error> {
+        Ok(batch.into_iter().map(|n| (n, n * n)).collect())
     }
 }
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let cfg = BatchConfig::default();
     println!(
         "config: window={:?} max_batch={} timeout={:?} concurrency={:?} max_waiting={:?}",
@@ -38,7 +34,11 @@ fn main() {
         cfg.max_waiting,
     );
 
-    let loader = SquareLoader;
-    let (a, b) = (loader.key(&7), loader.key(&7));
-    println!("key(7) = {a}, key(7) = {b} -> equal inputs share one batch entry");
+    let batch = HashSet::from([7u64, 7, 7]);
+    let out = SquareLoader.load(batch).await.expect("load succeeds");
+    println!(
+        "batch of three 7s -> {} entry: 7*7 = {}",
+        out.len(),
+        out[&7]
+    );
 }

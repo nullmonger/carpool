@@ -14,15 +14,13 @@ use crate::window;
 // window into one downstream call and replies over the request's oneshot.
 #[derive(Clone)]
 pub struct Batcher<C: BatchCollector> {
-    collector: C,
     inbound: mpsc::Sender<Request<C>>,
 }
 
 impl<C: BatchCollector> Batcher<C> {
     pub fn spawn(collector: C, config: BatchConfig) -> Self {
         let (inbound, requests) = mpsc::channel::<Request<C>>(config.max_batch_size.get());
-        // Capacity 1: hold at most one closed window; deeper buffering would only
-        // hide backpressure behind memory.
+        // Capacity 1: one closed window at a time - deeper buffering only masks backpressure.
         let (windows_tx, windows_rx) = mpsc::channel::<Vec<Request<C>>>(1);
         let slots = Slots::from_config(&config);
 
@@ -31,30 +29,16 @@ impl<C: BatchCollector> Batcher<C> {
             windows_tx,
             config.window,
             config.max_batch_size,
+            |req| req.input.clone(),
         ));
-        tokio::spawn(run_dispatcher(
-            collector.clone(),
-            windows_rx,
-            slots,
-            config.timeout,
-        ));
+        tokio::spawn(run_dispatcher(collector, windows_rx, slots, config.timeout));
 
-        Self { collector, inbound }
+        Self { inbound }
     }
 
     pub async fn load(&self, input: C::Input) -> Result<C::Output, Error<C::Error>> {
-        let key = self.collector.key(&input);
         let (respond, reply) = oneshot::channel();
-        if self
-            .inbound
-            .send(Request {
-                key,
-                input,
-                respond,
-            })
-            .await
-            .is_err()
-        {
+        if self.inbound.send(Request { input, respond }).await.is_err() {
             return Err(Error::Closed);
         }
         match reply.await {
@@ -108,7 +92,7 @@ fn warn_batch_panicked(_err: &tokio::task::JoinError) {}
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -126,21 +110,16 @@ mod tests {
     impl BatchCollector for Squares {
         type Input = u64;
         type Output = u64;
-        type Key = u64;
         type Error = std::convert::Infallible;
 
-        fn key(&self, input: &u64) -> u64 {
-            *input
-        }
-
-        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Self::Error> {
+        async fn load(&self, batch: HashSet<u64>) -> Result<HashMap<u64, u64>, Self::Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(batch.into_iter().map(|(k, v)| (k, v * v)).collect())
+            Ok(batch.into_iter().map(|x| (x, x * x)).collect())
         }
     }
 
-    // A loader whose window never closes on the timer (virtual time stays frozen),
-    // so windows close deterministically at `max` items - no scheduler race.
+    // Long window so closure is deterministic: it closes by size at `max` distinct inputs,
+    // or by the auto-advanced timer once fewer arrive and every task parks.
     fn loader(max: usize, calls: Arc<AtomicUsize>) -> Batcher<Squares> {
         let config = BatchConfig {
             window: Duration::from_secs(3600),
@@ -160,14 +139,16 @@ mod tests {
         results
     }
 
+    // max above the distinct-input count, so all five requests share one window
+    // (timer close) and collapse to a single downstream call.
     #[tokio::test(start_paused = true)]
-    async fn duplicate_keys_collapse_to_one_downstream_call() {
+    async fn duplicate_inputs_collapse_to_one_downstream_call() {
         let calls = Arc::new(AtomicUsize::new(0));
         let loader = loader(5, calls.clone());
 
         let handles = [1u64, 1, 1, 2, 2]
             .into_iter()
-            .map(|k| spawn_load_on(&loader, k))
+            .map(|input| spawn_load_on(&loader, input))
             .collect();
         let results = collect_results(handles).await;
 
@@ -180,13 +161,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn distinct_keys_each_get_their_own_result() {
+    async fn distinct_inputs_each_get_their_own_result() {
         let calls = Arc::new(AtomicUsize::new(0));
         let loader = loader(3, calls.clone());
 
         let handles = [2u64, 3, 4]
             .into_iter()
-            .map(|k| spawn_load_on(&loader, k))
+            .map(|input| spawn_load_on(&loader, input))
             .collect();
         let results = collect_results(handles).await;
 
@@ -252,20 +233,15 @@ mod tests {
     impl BatchCollector for Tracked {
         type Input = u64;
         type Output = u64;
-        type Key = u64;
         type Error = std::convert::Infallible;
 
-        fn key(&self, input: &u64) -> u64 {
-            *input
-        }
-
-        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Self::Error> {
+        async fn load(&self, batch: HashSet<u64>) -> Result<HashMap<u64, u64>, Self::Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(self.hold).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            Ok(batch)
+            Ok(batch.into_iter().map(|x| (x, x)).collect())
         }
     }
 
@@ -326,18 +302,13 @@ mod tests {
     impl BatchCollector for PanicOnce {
         type Input = u64;
         type Output = u64;
-        type Key = u64;
         type Error = std::convert::Infallible;
 
-        fn key(&self, input: &u64) -> u64 {
-            *input
-        }
-
-        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Self::Error> {
+        async fn load(&self, batch: HashSet<u64>) -> Result<HashMap<u64, u64>, Self::Error> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 panic!("downstream blew up");
             }
-            Ok(batch)
+            Ok(batch.into_iter().map(|x| (x, x)).collect())
         }
     }
 
@@ -390,18 +361,13 @@ mod tests {
     impl BatchCollector for Holder {
         type Input = u64;
         type Output = u64;
-        type Key = u64;
         type Error = std::convert::Infallible;
 
-        fn key(&self, input: &u64) -> u64 {
-            *input
-        }
-
-        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Self::Error> {
+        async fn load(&self, batch: HashSet<u64>) -> Result<HashMap<u64, u64>, Self::Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.entered.notify_one();
             tokio::time::sleep(self.hold).await;
-            Ok(batch)
+            Ok(batch.into_iter().map(|x| (x, x)).collect())
         }
     }
 
@@ -484,18 +450,13 @@ mod tests {
     impl BatchCollector for SlowOnce {
         type Input = u64;
         type Output = u64;
-        type Key = u64;
         type Error = std::convert::Infallible;
 
-        fn key(&self, input: &u64) -> u64 {
-            *input
-        }
-
-        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Self::Error> {
+        async fn load(&self, batch: HashSet<u64>) -> Result<HashMap<u64, u64>, Self::Error> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 tokio::time::sleep(self.slow).await;
             }
-            Ok(batch)
+            Ok(batch.into_iter().map(|x| (x, x)).collect())
         }
     }
 
@@ -599,7 +560,7 @@ mod tests {
     impl std::error::Error for Boom {}
 
     // How MisbehaveOnce breaks its first call:
-    // a downstream error or a contract violation (an unknown key in the response).
+    // a downstream error or a contract violation (an unknown input in the response).
     #[derive(Clone, Copy)]
     enum Misbehavior {
         Error,
@@ -615,25 +576,20 @@ mod tests {
     impl BatchCollector for MisbehaveOnce {
         type Input = u64;
         type Output = u64;
-        type Key = u64;
         type Error = Boom;
 
-        fn key(&self, input: &u64) -> u64 {
-            *input
-        }
-
-        async fn load(&self, batch: HashMap<u64, u64>) -> Result<HashMap<u64, u64>, Boom> {
+        async fn load(&self, batch: HashSet<u64>) -> Result<HashMap<u64, u64>, Boom> {
+            let mut out: HashMap<u64, u64> = batch.into_iter().map(|x| (x, x)).collect();
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 match self.how {
                     Misbehavior::Error => return Err(Boom),
+                    // input never requested -> ContractViolation
                     Misbehavior::Contract => {
-                        let mut out = batch;
-                        out.insert(u64::MAX, 0); // key never requested -> ContractViolation
-                        return Ok(out);
+                        out.insert(u64::MAX, 0);
                     }
                 }
             }
-            Ok(batch)
+            Ok(out)
         }
     }
 
