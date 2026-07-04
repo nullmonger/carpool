@@ -6,16 +6,16 @@ duplicate inputs share one result. No cache, trait-based API, built on `tokio`.
 
 ## Status
 
-Pre-release. The crate is built and released feature by feature; nothing is
-published yet.
+Pre-release. The crate is built and released feature by feature;
+nothing is published yet.
 
-- [ ] `transit` - the waiting primitive underneath everything else: `Ride`
-      (an ordered set of waiters with exact membership) and `Logue`
-      (a keyed router over rides). First release.
-- [ ] `Deduplicator` - single-flight per input over a user-implemented
-      `Fetcher`; a flight lives while at least one caller is still waiting.
-- [ ] `Batcher` - collection-window batching over a user-implemented
-      `BatchCollector`, with an input-addressed result contract.
+- [ ] `transit` - the waiting primitive underneath everything else:
+      `Ride` (an ordered set of waiters with exact membership)
+      and `Logue` (a keyed router over rides). First release.
+- [ ] `Deduplicator` - single-flight per input over a user-implemented `Fetcher`;
+      a flight lives while at least one caller is still waiting.
+- [ ] `Batcher` - collection-window batching over a user-implemented `BatchCollector`,
+      with an input-addressed result contract.
 - [ ] `Loader` - deduplication in front of batching.
 - [ ] Metrics - instrumentation of windows, batches, and flights.
 - [ ] Tracing - OpenTelemetry spans linked to individual `load` calls.
