@@ -237,6 +237,25 @@ impl<P: Send + 'static> Ride<P> {
     }
 }
 
+impl<P> IntoIterator for Ride<P> {
+    type Item = P;
+    type IntoIter = std::vec::IntoIter<P>;
+
+    // Drain: extract seats under the lock, then hand out cargo off-lock in order.
+    fn into_iter(self) -> Self::IntoIter {
+        let seats = {
+            let mut state = locked(&self.inner.state);
+            // Clear locs under the lock so a mid-drain Pass drop no-ops, not spins.
+            for entry in state.seats.values() {
+                *locked(&entry.cell.loc) = None;
+            }
+            std::mem::take(&mut state.seats)
+        };
+        let cargo: Vec<P> = seats.into_values().map(|entry| entry.cargo).collect();
+        cargo.into_iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +333,25 @@ mod tests {
         let ride: Ride<u32> = Ride::new();
         let _p = ride.board(1);
         ride.boarded().await;
+    }
+
+    #[test]
+    fn draining_empties_the_shared_instance() {
+        let ride: Ride<u32> = Ride::new();
+        let _passes: Vec<Pass> = (0..3).map(|i| ride.board(i)).collect();
+        let other = ride.clone();
+        let drained: Vec<u32> = ride.into_iter().collect();
+        assert_eq!(drained, vec![0, 1, 2]); // boarding order preserved
+        assert_eq!(other.len(), 0); // shared instance emptied for other holders
+    }
+
+    #[test]
+    fn a_pass_dropped_after_drain_is_a_noop() {
+        let ride: Ride<u32> = Ride::new();
+        let p = ride.board(1);
+        let other = ride.clone();
+        let _drained: Vec<u32> = ride.into_iter().collect();
+        drop(p); // loc cleared by drain, so this no-ops
+        assert_eq!(other.len(), 0);
     }
 }
