@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use tokio::sync::Notify;
+
 // Mutex guard that recovers a poisoned lock via into_inner.
 // A panic under the lock must not brick the ride.
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -21,11 +23,15 @@ impl<P> Clone for Ride<P> {
 
 struct RideInner<P> {
     state: Mutex<RideState<P>>,
+    boarded: Notify,
+    abandoned: Notify,
 }
 
 struct RideState<P> {
     seats: BTreeMap<usize, SeatEntry<P>>,
     next_id: usize,
+    departed: bool,
+    abandoned: bool,
 }
 
 // The ride keeps each seat's cell so take() can readdress a moved seat's loc.
@@ -61,6 +67,13 @@ trait Leave {
     fn leave(&self);
 }
 
+// Outcome of one leave attempt against the ride the seat currently points to.
+enum Leaving<P> {
+    Removed { entry: SeatEntry<P>, emptied: bool },
+    Relocated, // seat moved; retry with fresh loc
+    Departed,  // ride left; seat stays, drop is a no-op
+}
+
 impl<P: Send> Leave for SeatCell<P> {
     fn leave(&self) {
         loop {
@@ -72,18 +85,40 @@ impl<P: Send> Leave for SeatCell<P> {
                 }
             };
             let Some(ride) = weak.upgrade() else { return };
-            // Bind the removed entry so the ride lock releases before its payload drops:
-            // a P that owns another Pass must not re-enter leave under our lock.
-            let removed = locked(&ride.state).seats.remove(&id);
-            match removed {
+            // Decide removal and the abandon latch under one lock;
+            // act off-lock (drop payload, notify) so no user code runs under it.
+            let outcome = {
+                let mut state = locked(&ride.state);
+                if state.departed {
+                    Leaving::Departed
+                } else if let Some(entry) = state.seats.remove(&id) {
+                    let emptied = state.seats.is_empty() && !state.abandoned;
+                    if emptied {
+                        state.abandoned = true;
+                    }
+                    Leaving::Removed { entry, emptied }
+                } else {
+                    Leaving::Relocated
+                }
+            };
+            match outcome {
                 // Found it: loc pinned this exact (ride, id), so it is our seat.
-                Some(SeatEntry { cargo, .. }) => {
+                Leaving::Removed {
+                    entry: SeatEntry { cargo, .. },
+                    emptied,
+                } => {
                     *locked(&self.loc) = None;
+                    // Signal before the cargo drop:
+                    // a panicking P::drop must not swallow the one-shot abandon wakeup.
+                    if emptied {
+                        ride.abandoned.notify_waiters();
+                    }
                     drop(cargo);
                     return;
                 }
+                Leaving::Departed => return,
                 // Gone: the seat relocated after we read loc. Retry (hand-over-hand).
-                None => continue,
+                Leaving::Relocated => continue,
             }
         }
     }
@@ -102,7 +137,11 @@ impl<P: Send + 'static> Ride<P> {
                 state: Mutex::new(RideState {
                     seats: BTreeMap::new(),
                     next_id: 0,
+                    departed: false,
+                    abandoned: false,
                 }),
+                boarded: Notify::new(),
+                abandoned: Notify::new(),
             }),
         }
     }
@@ -125,6 +164,7 @@ impl<P: Send + 'static> Ride<P> {
             },
         );
         drop(state);
+        self.inner.boarded.notify_waiters();
         Pass { seat: cell }
     }
 
@@ -162,6 +202,38 @@ impl<P: Send + 'static> Ride<P> {
 
     pub fn is_empty(&self) -> bool {
         locked(&self.inner.state).seats.is_empty()
+    }
+
+    // Seal the ride: a Pass dropped afterwards no-ops (see Leaving::Departed).
+    pub fn depart(&self) {
+        locked(&self.inner.state).departed = true;
+    }
+
+    // Resolve once every seat has left before departure (the abandon latch).
+    // The latch is irreversible, so this stays ready afterwards.
+    pub async fn abandoned(&self) {
+        loop {
+            let mut signal = std::pin::pin!(self.inner.abandoned.notified());
+            signal.as_mut().enable();
+            let latched = locked(&self.inner.state).abandoned;
+            if latched {
+                return;
+            }
+            signal.await;
+        }
+    }
+
+    // Resolve once the ride holds a seat.
+    // Enable before the check so a boarding in the gap is not lost.
+    pub async fn boarded(&self) {
+        loop {
+            let mut signal = std::pin::pin!(self.inner.boarded.notified());
+            signal.as_mut().enable();
+            if !self.is_empty() {
+                return;
+            }
+            signal.await;
+        }
     }
 }
 
@@ -215,5 +287,32 @@ mod tests {
         assert_eq!((taken.len(), ride.len()), (1, 1));
         drop(p1);
         assert_eq!((taken.len(), ride.len()), (0, 1));
+    }
+
+    #[test]
+    fn after_depart_dropping_a_pass_is_a_noop() {
+        let ride: Ride<u32> = Ride::new();
+        let p = ride.board(1);
+        let _p2 = ride.board(2);
+        ride.depart();
+        drop(p); // no-op after departure: the seat stays for delivery
+        assert_eq!(ride.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn abandoned_latches_when_the_last_seat_leaves() {
+        let ride: Ride<u32> = Ride::new();
+        let p1 = ride.board(1);
+        let p2 = ride.board(2);
+        drop(p1);
+        drop(p2); // last to leave sets the latch synchronously
+        ride.abandoned().await;
+    }
+
+    #[tokio::test]
+    async fn boarded_resolves_once_a_seat_is_present() {
+        let ride: Ride<u32> = Ride::new();
+        let _p = ride.board(1);
+        ride.boarded().await;
     }
 }
