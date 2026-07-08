@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use tokio::sync::Notify;
@@ -32,6 +33,7 @@ struct RideState<P> {
     next_id: usize,
     departed: bool,
     abandoned: bool,
+    drained: bool,
 }
 
 // The ride keeps each seat's cell so take() can readdress a moved seat's loc.
@@ -139,6 +141,7 @@ impl<P: Send + 'static> Ride<P> {
                     next_id: 0,
                     departed: false,
                     abandoned: false,
+                    drained: false,
                 }),
                 boarded: Notify::new(),
                 abandoned: Notify::new(),
@@ -147,7 +150,30 @@ impl<P: Send + 'static> Ride<P> {
     }
 
     pub fn board(&self, cargo: P) -> Pass {
-        let mut state = locked(&self.inner.state);
+        let pass = {
+            let mut state = locked(&self.inner.state);
+            self.seat(&mut state, cargo)
+        };
+        self.inner.boarded.notify_waiters();
+        pass
+    }
+
+    // Board only into a still-open ride (not abandoned, departed, or drained);
+    // otherwise hand the cargo back so the caller (Logue) founds a fresh ride.
+    fn try_board(&self, cargo: P) -> Result<Pass, P> {
+        let pass = {
+            let mut state = locked(&self.inner.state);
+            if state.abandoned || state.departed || state.drained {
+                return Err(cargo);
+            }
+            self.seat(&mut state, cargo)
+        };
+        self.inner.boarded.notify_waiters();
+        Ok(pass)
+    }
+
+    // Insert a seat under the held lock and return its Pass; the caller notifies.
+    fn seat(&self, state: &mut RideState<P>, cargo: P) -> Pass {
         let id = state.next_id;
         state.next_id += 1;
         let cell = Arc::new(SeatCell {
@@ -163,8 +189,6 @@ impl<P: Send + 'static> Ride<P> {
                 cell: Arc::clone(&cell),
             },
         );
-        drop(state);
-        self.inner.boarded.notify_waiters();
         Pass { seat: cell }
     }
 
@@ -249,10 +273,69 @@ impl<P> IntoIterator for Ride<P> {
             for entry in state.seats.values() {
                 *locked(&entry.cell.loc) = None;
             }
+            state.drained = true;
             std::mem::take(&mut state.seats)
         };
         let cargo: Vec<P> = seats.into_values().map(|entry| entry.cargo).collect();
         cargo.into_iter()
+    }
+}
+
+// Result of book(): either joined an existing ride,
+// or founded a new one whose handle comes back (to drive it and check out by identity).
+pub enum Booking<P> {
+    Joined(Pass),
+    Founded(Pass, Ride<P>),
+}
+
+pub struct Logue<K, P> {
+    rides: Mutex<HashMap<K, Ride<P>>>,
+}
+
+impl<K, P> Default for Logue<K, P> {
+    fn default() -> Self {
+        Logue {
+            rides: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K, P> Logue<K, P> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl<K: Hash + Eq + Clone, P: Send + 'static> Logue<K, P> {
+    // Join the key's live ride, or found a new one.
+    // An abandoned ride under the key is not joined: it is replaced by the freshly founded one.
+    pub fn book(&self, key: K, cargo: P) -> Booking<P> {
+        let mut rides = locked(&self.rides);
+        let cargo = if let Some(ride) = rides.get(&key) {
+            match ride.try_board(cargo) {
+                Ok(pass) => return Booking::Joined(pass),
+                Err(cargo) => cargo, // abandoned: reuse cargo to found a new ride
+            }
+        } else {
+            cargo
+        };
+        let ride = Ride::new();
+        let pass = ride.board(cargo);
+        rides.insert(key, ride.clone());
+        Booking::Founded(pass, ride)
+    }
+
+    // Remove the key's ride only if it is this exact ride (by identity),
+    // so a stale checkout cannot evict a fresh same-key ride.
+    pub fn checkout(&self, key: &K, ride: &Ride<P>) -> bool {
+        let mut rides = locked(&self.rides);
+        let matches = rides
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(&current.inner, &ride.inner));
+        if matches {
+            rides.remove(key);
+        }
+        matches
     }
 }
 
@@ -353,5 +436,41 @@ mod tests {
         let _drained: Vec<u32> = ride.into_iter().collect();
         drop(p); // loc cleared by drain, so this no-ops
         assert_eq!(other.len(), 0);
+    }
+
+    #[test]
+    fn book_founds_then_joins_the_same_key() {
+        let logue: Logue<u32, u32> = Logue::new();
+        let first = logue.book(1, 100);
+        assert!(matches!(&first, Booking::Founded(..)));
+        // first stays aboard, so booking the same key joins the live ride
+        let second = logue.book(1, 101);
+        assert!(matches!(&second, Booking::Joined(_)));
+    }
+
+    #[test]
+    fn checkout_only_removes_the_identical_ride() {
+        let logue: Logue<u32, u32> = Logue::new();
+        let Booking::Founded(p1, ride1) = logue.book(1, 100) else {
+            panic!("first book founds");
+        };
+        drop(p1); // ride1 empties and latches abandoned
+        let Booking::Founded(_p2, ride2) = logue.book(1, 101) else {
+            panic!("an abandoned ride is replaced, so this founds again");
+        };
+        assert!(!logue.checkout(&1, &ride1)); // stale handle evicts nothing
+        assert!(logue.checkout(&1, &ride2)); // the current ride checks out
+    }
+
+    #[test]
+    fn book_founds_again_after_the_ride_is_drained() {
+        let logue: Logue<u32, u32> = Logue::new();
+        let Booking::Founded(_p1, ride1) = logue.book(1, 100) else {
+            panic!("first book founds");
+        };
+        let _drained: Vec<u32> = ride1.into_iter().collect();
+        // the drained ride is terminal, so booking the same key founds a new one
+        let second = logue.book(1, 101);
+        assert!(matches!(&second, Booking::Founded(..)));
     }
 }
