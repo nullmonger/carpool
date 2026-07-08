@@ -24,8 +24,14 @@ struct RideInner<P> {
 }
 
 struct RideState<P> {
-    seats: BTreeMap<usize, P>,
+    seats: BTreeMap<usize, SeatEntry<P>>,
     next_id: usize,
+}
+
+// The ride keeps each seat's cell so take() can readdress a moved seat's loc.
+struct SeatEntry<P> {
+    cargo: P,
+    cell: Arc<SeatCell<P>>,
 }
 
 // A seat's coordinate, shared between its Pass and the ride.
@@ -66,13 +72,14 @@ impl<P: Send> Leave for SeatCell<P> {
                 }
             };
             let Some(ride) = weak.upgrade() else { return };
-            // Bind the removed cargo so the ride lock releases before P drops:
+            // Bind the removed entry so the ride lock releases before its payload drops:
             // a P that owns another Pass must not re-enter leave under our lock.
             let removed = locked(&ride.state).seats.remove(&id);
             match removed {
                 // Found it: loc pinned this exact (ride, id), so it is our seat.
-                Some(_cargo) => {
+                Some(SeatEntry { cargo, .. }) => {
                     *locked(&self.loc) = None;
+                    drop(cargo);
                     return;
                 }
                 // Gone: the seat relocated after we read loc. Retry (hand-over-hand).
@@ -110,9 +117,43 @@ impl<P: Send + 'static> Ride<P> {
                 id,
             })),
         });
-        state.seats.insert(id, cargo);
+        state.seats.insert(
+            id,
+            SeatEntry {
+                cargo,
+                cell: Arc::clone(&cell),
+            },
+        );
         drop(state);
         Pass { seat: cell }
+    }
+
+    // Move the first n seats (boarding order) to a fresh ride; the tail stays.
+    // No new Pass: each holder's guard is readdressed to the taken ride.
+    pub fn take(&self, n: usize) -> Ride<P> {
+        let taken = Ride::new();
+        let mut src = locked(&self.inner.state);
+        let front = if n >= src.seats.len() {
+            std::mem::take(&mut src.seats)
+        } else {
+            let split_key = *src.seats.keys().nth(n).expect("n < len in this branch");
+            let tail = src.seats.split_off(&split_key);
+            std::mem::replace(&mut src.seats, tail)
+        };
+        {
+            let mut dst = locked(&taken.inner.state);
+            for (id, entry) in front {
+                *locked(&entry.cell.loc) = Some(Loc {
+                    ride: Arc::downgrade(&taken.inner),
+                    id,
+                });
+                dst.seats.insert(id, entry);
+            }
+            // Carry the counter so a later board on taken cannot reuse a moved seat's id.
+            dst.next_id = src.next_id;
+        }
+        drop(src);
+        taken
     }
 
     pub fn len(&self) -> usize {
@@ -148,5 +189,31 @@ mod tests {
         drop(p1);
         drop(p3);
         assert_eq!(ride.len(), 0);
+    }
+
+    #[test]
+    fn take_edges_move_none_or_all() {
+        let ride: Ride<u32> = Ride::new();
+        let _passes: Vec<Pass> = (0..3).map(|i| ride.board(i)).collect();
+
+        let none = ride.take(0);
+        assert_eq!((none.len(), ride.len()), (0, 3));
+
+        let all = ride.take(5); // n > len moves everything
+        assert_eq!((all.len(), ride.len()), (3, 0));
+    }
+
+    #[test]
+    fn a_moved_pass_leaves_from_its_new_ride() {
+        let ride: Ride<u32> = Ride::new();
+        let p0 = ride.board(0);
+        let p1 = ride.board(1);
+        let _p2 = ride.board(2);
+        let taken = ride.take(2); // p0, p1 relocate to taken; p2 stays
+        assert_eq!((taken.len(), ride.len()), (2, 1));
+        drop(p0);
+        assert_eq!((taken.len(), ride.len()), (1, 1));
+        drop(p1);
+        assert_eq!((taken.len(), ride.len()), (0, 1));
     }
 }
