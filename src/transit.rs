@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::hash::Hash;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::task::{Context, Poll};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 
 // Mutex guard that recovers a poisoned lock via into_inner.
 // A panic under the lock must not brick the ride.
@@ -152,6 +155,10 @@ impl<P: Send + 'static> Ride<P> {
     pub fn board(&self, cargo: P) -> Pass {
         let pass = {
             let mut state = locked(&self.inner.state);
+            debug_assert!(
+                !(state.abandoned || state.departed || state.drained),
+                "board on a terminal ride; join through Logue instead"
+            );
             self.seat(&mut state, cargo)
         };
         self.inner.boarded.notify_waiters();
@@ -306,7 +313,7 @@ impl<K, P> Logue<K, P> {
     }
 }
 
-impl<K: Hash + Eq + Clone, P: Send + 'static> Logue<K, P> {
+impl<K: Hash + Eq, P: Send + 'static> Logue<K, P> {
     // Join the key's live ride, or found a new one.
     // An abandoned ride under the key is not joined: it is replaced by the freshly founded one.
     pub fn book(&self, key: K, cargo: P) -> Booking<P> {
@@ -339,9 +346,35 @@ impl<K: Hash + Eq + Clone, P: Send + 'static> Logue<K, P> {
     }
 }
 
+// A caller-side handle: the seat's Pass plus the receiver for its result.
+// The only transit type that knows the result type T.
+#[must_use = "await the Ticket for the result; dropping it cancels the request"]
+pub struct Ticket<T> {
+    // Held only for its Drop: keeps the seat aboard, leaves it if the Ticket drops.
+    _pass: Pass,
+    rx: oneshot::Receiver<T>,
+}
+
+impl<T> Ticket<T> {
+    pub fn new(pass: Pass, rx: oneshot::Receiver<T>) -> Self {
+        Ticket { _pass: pass, rx }
+    }
+}
+
+impl<T> Future for Ticket<T> {
+    type Output = Result<T, oneshot::error::RecvError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().rx).poll(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn boarding_accumulates_seats() {
@@ -472,5 +505,193 @@ mod tests {
         // the drained ride is terminal, so booking the same key founds a new one
         let second = logue.book(1, 101);
         assert!(matches!(&second, Booking::Founded(..)));
+    }
+
+    #[tokio::test]
+    async fn a_delivered_ticket_resolves_to_the_value() {
+        let ride: Ride<(u32, oneshot::Sender<u32>)> = Ride::new();
+        let (tx, rx) = oneshot::channel();
+        let ticket = Ticket::new(ride.board((1, tx)), rx);
+        for (input, tx) in ride.into_iter() {
+            tx.send(input * 10).expect("receiver is alive");
+        }
+        assert_eq!(ticket.await, Ok(10));
+    }
+
+    #[test]
+    fn dropping_a_ticket_leaves_the_ride() {
+        let ride: Ride<(u32, oneshot::Sender<u32>)> = Ride::new();
+        let (tx, rx) = oneshot::channel();
+        let ticket = Ticket::new(ride.board((1, tx)), rx);
+        assert_eq!(ride.len(), 1);
+        drop(ticket); // drops the pass, so the seat leaves
+        assert_eq!(ride.len(), 0);
+    }
+
+    // Race catalog. The primitive has no internal timers,
+    // so each race is real cross-thread Mutex/Notify concurrency,
+    // repeated to shake out interleavings.
+    // The timeout in the signal races only guards against a hung (lost) wakeup.
+
+    #[test]
+    fn race_concurrent_boards_reach_one_drain() {
+        for _ in 0..50 {
+            let ride: Ride<u32> = Ride::new();
+            let n = 8u32;
+            let start = Barrier::new(n as usize + 1);
+            let passes = Mutex::new(Vec::new());
+            thread::scope(|s| {
+                for i in 0..n {
+                    let ride = &ride;
+                    let passes = &passes;
+                    let start = &start;
+                    s.spawn(move || {
+                        let pass = ride.board(i);
+                        locked(passes).push(pass);
+                        start.wait();
+                    });
+                }
+                start.wait();
+            });
+            let mut drained: Vec<u32> = ride.into_iter().collect();
+            drained.sort_unstable();
+            assert_eq!(drained, (0..n).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn race_take_against_leave() {
+        for _ in 0..100 {
+            let ride: Ride<u32> = Ride::new();
+            let mut passes: Vec<Pass> = (0..6).map(|i| ride.board(i)).collect();
+            let victim = passes.remove(0); // seat 0 sits in the take(3) prefix
+            let start = Barrier::new(2);
+            let taken = thread::scope(|s| {
+                let taker = {
+                    let ride = &ride;
+                    let start = &start;
+                    s.spawn(move || {
+                        start.wait();
+                        ride.take(3)
+                    })
+                };
+                start.wait();
+                drop(victim); // leave seat 0 as it may be relocating
+                taker.join().unwrap()
+            });
+            // 6 boarded minus the one that left: removed exactly once, never doubled.
+            assert_eq!(taken.len() + ride.len(), 5);
+        }
+    }
+
+    #[test]
+    fn race_drain_against_leave() {
+        for _ in 0..100 {
+            let ride: Ride<u32> = Ride::new();
+            let mut passes: Vec<Pass> = (0..6).map(|i| ride.board(i)).collect();
+            let victim = passes.remove(0);
+            let start = Barrier::new(2);
+            let delivered = thread::scope(|s| {
+                let drainer = {
+                    let ride = &ride;
+                    let start = &start;
+                    s.spawn(move || {
+                        start.wait();
+                        ride.clone().into_iter().count()
+                    })
+                };
+                start.wait();
+                drop(victim);
+                drainer.join().unwrap()
+            });
+            // seat 0 either left before the drain or was delivered by it, never both.
+            assert!(delivered == 5 || delivered == 6);
+        }
+    }
+
+    #[test]
+    fn race_book_against_abandonment() {
+        for _ in 0..100 {
+            let logue: Logue<u32, u32> = Logue::new();
+            let Booking::Founded(founder, ride) = logue.book(1, 0) else {
+                unreachable!("first book founds");
+            };
+            let start = Barrier::new(2);
+            let booking = thread::scope(|s| {
+                let booker = {
+                    let logue = &logue;
+                    let start = &start;
+                    s.spawn(move || {
+                        start.wait();
+                        logue.book(1, 1)
+                    })
+                };
+                start.wait();
+                drop(founder); // last seat leaves as the booking runs
+                booker.join().unwrap()
+            });
+            match booking {
+                // joined the founder's ride: the booker's seat kept it alive
+                Booking::Joined(_pass) => assert_eq!(ride.len(), 1),
+                // founded a replacement: the founder's ride had already abandoned
+                Booking::Founded(_pass, fresh) => assert_eq!(fresh.len(), 1),
+            }
+        }
+    }
+
+    #[test]
+    fn race_board_wakes_a_boarded_waiter() {
+        for _ in 0..50 {
+            let ride: Ride<u32> = Ride::new();
+            let start = Barrier::new(2);
+            thread::scope(|s| {
+                let waiter = {
+                    let ride = &ride;
+                    let start = &start;
+                    s.spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_time()
+                            .build()
+                            .unwrap();
+                        start.wait();
+                        rt.block_on(async {
+                            tokio::time::timeout(Duration::from_secs(2), ride.boarded())
+                                .await
+                                .expect("board must wake the waiter");
+                        });
+                    })
+                };
+                start.wait();
+                let _pass = ride.board(1);
+                waiter.join().unwrap(); // join while the seat is still aboard
+            });
+        }
+    }
+
+    #[test]
+    fn race_last_leave_wakes_an_abandoned_waiter() {
+        for _ in 0..50 {
+            let ride: Ride<u32> = Ride::new();
+            let pass = ride.board(1);
+            let start = Barrier::new(2);
+            thread::scope(|s| {
+                let ride = &ride;
+                let start = &start;
+                s.spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                        .unwrap();
+                    start.wait();
+                    rt.block_on(async {
+                        tokio::time::timeout(Duration::from_secs(2), ride.abandoned())
+                            .await
+                            .expect("the last leave must wake the waiter");
+                    });
+                });
+                start.wait();
+                drop(pass); // last seat leaves, latching abandonment
+            });
+        }
     }
 }
