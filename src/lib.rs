@@ -8,3 +8,5 @@
 //! this version ships the crate skeleton only.
 
 #![forbid(unsafe_code)]
+
+pub mod transit;
