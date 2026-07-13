@@ -9,9 +9,10 @@ duplicate inputs share one result. No cache, trait-based API, built on `tokio`.
 Pre-release. The crate is built and released feature by feature;
 nothing is published yet.
 
-- [ ] `transit` - the waiting primitive underneath everything else:
-      `Ride` (an ordered set of waiters with exact membership)
-      and `Logue` (a keyed router over rides). First release.
+- [ ] `queue` - the pending-request queue underneath the batching side:
+      entries pair an input with its `oneshot` reply sender, liveness is
+      read lazily from the channel, batches are sliced by timer or by
+      threshold. First release.
 - [ ] `Deduplicator` - single-flight per input over a user-implemented `Fetcher`;
       a flight lives while at least one caller is still waiting.
 - [ ] `Batcher` - collection-window batching over a user-implemented `BatchCollector`,

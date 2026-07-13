@@ -187,8 +187,8 @@ mod tests {
         q.reached(2).await;
     }
 
-    // Race catalog. Same discipline as transit: no internal timers,
-    // real cross-thread concurrency, repeated to shake out interleavings.
+    // Race catalog: no internal timers, so each race is real cross-thread
+    // concurrency, repeated to shake out interleavings.
 
     #[test]
     fn race_concurrent_pushes_reach_one_take() {
