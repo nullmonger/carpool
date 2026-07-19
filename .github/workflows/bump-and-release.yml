@@ -4,28 +4,28 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Semver bump level"
+        description: "Release action"
         type: choice
         options:
           - patch
           - minor
           - major
+          - beta
+          - beta-minor
+          - beta-major
+          - finalize
         default: patch
-      beta:
-        description: "Append -beta.N suffix"
-        type: boolean
-        default: false
-      force_release:
-        description: "Create GitHub Release even for beta"
-        type: boolean
-        default: false
       commit_note:
         description: "Optional text appended to commit message"
         type: string
         default: ""
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   checks:
@@ -34,105 +34,10 @@ jobs:
   bump:
     needs: checks
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: voidmason/bump-release@v1
         with:
-          # PAT so the bump commit can be pushed to protected master.
-          # GITHUB_TOKEN (github-actions[bot]) cannot bypass branch rules.
+          # PAT: GITHUB_TOKEN cannot push the bump commit to protected master.
           token: ${{ secrets.RELEASE_TOKEN }}
-          # Keep the PAT out of .git/config for later steps; the push step
-          # passes it explicitly. fetch-depth 0 already brings every tag.
-          persist-credentials: false
-          fetch-depth: 0
-
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-edit
-
-      - name: Configure git
-        run: |
-          git config user.name "nerjs"
-          git config user.email "nerjs.stap@gmail.com"
-
-      - name: Compute next version
-        id: ver
-        env:
-          BUMP_LEVEL: ${{ inputs.version }}
-          IS_BETA: ${{ inputs.beta }}
-        run: |
-          set -euo pipefail
-          CURRENT=$(cargo read-manifest | jq -r .version)
-          BASE_CURRENT=${CURRENT%%-*}
-          IFS=. read MAJ MIN PAT <<< "$BASE_CURRENT"
-          case "$BUMP_LEVEL" in
-            patch) NEXT_BASE="$MAJ.$MIN.$((PAT+1))" ;;
-            minor) NEXT_BASE="$MAJ.$((MIN+1)).0" ;;
-            major) NEXT_BASE="$((MAJ+1)).0.0" ;;
-          esac
-          if [ "$IS_BETA" = "true" ]; then
-            N=$(git tag --list "v${NEXT_BASE}-beta.*" | sed "s/.*-beta\.//" | sort -n | tail -n1)
-            N=$((${N:-0}+1))
-            NEXT="${NEXT_BASE}-beta.${N}"
-          else
-            NEXT="${NEXT_BASE}"
-          fi
-          # --workspace bumps every member, including crates that inherit the
-          # version via version.workspace = true. A lone package is a one-member
-          # workspace, so this is also correct for the single-crate layout.
-          cargo set-version --workspace "$NEXT"
-          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
-
-      - name: Commit
-        env:
-          NEXT_VERSION: ${{ steps.ver.outputs.next }}
-          COMMIT_NOTE: ${{ inputs.commit_note }}
-        run: |
-          set -euo pipefail
-          MSG="Bump version to v${NEXT_VERSION}"
-          if [ -n "$COMMIT_NOTE" ]; then
-            MSG="${MSG}"$'\n\n'"${COMMIT_NOTE}"
-          fi
-          # Stage every manifest the bump touched - root plus all workspace
-          # members - and Cargo.lock. -u is limited to tracked files, so the
-          # clean CI checkout never stages build artifacts.
-          git add -u
-          git commit -m "$MSG"
-
-      - name: Tag and push
-        id: tag
-        env:
-          NEXT_VERSION: ${{ steps.ver.outputs.next }}
-          BRANCH: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAG="v${NEXT_VERSION}"
-          git tag -a "$TAG" -m "$TAG"
-          git push "https://x-access-token:${RELEASE_TOKEN}@github.com/${REPO}.git" "$BRANCH" --follow-tags
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-  release:
-    needs: bump
-    if: ${{ !inputs.beta || inputs.force_release }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.bump.outputs.tag }}
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.bump.outputs.tag }}
-          IS_BETA: ${{ inputs.beta }}
-        run: |
-          set -euo pipefail
-          FLAGS="--generate-notes"
-          if [ "$IS_BETA" = "true" ]; then
-            FLAGS="$FLAGS --prerelease"
-          fi
-          gh release create "$TAG" $FLAGS
+          version: ${{ inputs.version }}
+          commit_note: ${{ inputs.commit_note }}

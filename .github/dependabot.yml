@@ -4,7 +4,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-      time: "06:00"
+    target-branch: "dependencies"
     open-pull-requests-limit: 5
     assignees:
       - nerjs
@@ -12,6 +12,15 @@ updates:
       - dependencies
       - bot
     groups:
+      infra:
+        patterns:
+          - tokio
+          - tracing
+          - metrics
+      tests:
+        patterns:
+          - criterion
+        
       rust-minor-patch:
         update-types:
           - minor
@@ -21,7 +30,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-      time: "06:00"
+    target-branch: "dependencies"
     open-pull-requests-limit: 5
     assignees:
       - nerjs
