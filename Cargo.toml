@@ -1,6 +1,6 @@
 [package]
 name = "carpool"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
 description = "Deduplicate and batch concurrent async requests through a collection window"
