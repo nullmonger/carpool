@@ -9,6 +9,15 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["async", "batch", "dataloader", "dedup", "tokio"]
 categories = ["asynchronous", "concurrency"]
+include = [
+    "src/",
+    "benches/",
+    "examples/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+]
 
 [dependencies]
 tokio = { version = "1", default-features = false, features = ["sync", "time"] }
