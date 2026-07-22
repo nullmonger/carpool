@@ -11,7 +11,7 @@ The crate is built and released feature by feature.
 - [x] `queue` - the pending-request queue underneath the batching side:
       entries pair an input with its `oneshot` reply sender,
       liveness is read lazily from the channel,
-      batches are sliced by timer or by threshold. First release.
+      batches are sliced by timer or by threshold.
 - [ ] `Deduplicator` - single-flight per input over a user-implemented `Fetcher`;
       a flight lives while at least one caller is still waiting.
 - [ ] `Batcher` - collection-window batching over a user-implemented `BatchCollector`,
@@ -26,7 +26,7 @@ An earlier prototype of the whole stack lives on the `draft` branch.
 
 ```console
 cargo add carpool
-cargo add tokio --features macros,rt-multi-thread,sync
+cargo add tokio --features macros,rt-multi-thread,sync,time
 ```
 
 The queue stores pending requests and slices batches; delivery stays with the consumer:

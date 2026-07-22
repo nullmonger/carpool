@@ -20,11 +20,11 @@ include = [
 ]
 
 [dependencies]
-tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+tokio = { version = "1.16", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 criterion = "0.8.2"
-tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
+tokio = { version = "1.16", default-features = false, features = ["macros", "rt", "time"] }
 
 [[bench]]
 name = "queue"

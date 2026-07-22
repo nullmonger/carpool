@@ -1,8 +1,8 @@
 //! Pending requests awaiting a batch.
 //!
 //! A [`Queue`] pairs each input with the [`oneshot::Sender`] its caller awaits.
-//! Batches are sliced off in arrival order: by timer via [`Queue::take`],
-//! or by threshold via [`Queue::take_if`].
+//! Batches are sliced off in arrival order:
+//! by threshold via [`Queue::take_if`], or by timer via [`Queue::reached`] and [`Queue::take`].
 //!
 //! Liveness is read lazily from the channel: a caller leaves by dropping its receiver,
 //! and only the scans inside `take` and `take_if` bury dead entries.
@@ -18,8 +18,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use tokio::sync::{Notify, oneshot};
 
-// Mutex guard that recovers a poisoned lock via into_inner.
-// A panic under the lock must not brick the queue.
+// A panic under the lock must not brick the queue: recover the poisoned mutex.
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -29,7 +28,7 @@ pub type Pending<I, O> = (I, oneshot::Sender<O>);
 
 /// Unbounded FIFO queue of pending requests.
 ///
-/// [`push`](Queue::push) never fails and never blocks; bounding is the consumer's policy,
+/// [`push`](Queue::push) never fails and applies no backpressure; bounding is the consumer's policy,
 /// as is sharing - wrap the queue in an `Arc` to hand it around.
 ///
 /// # Examples
