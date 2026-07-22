@@ -1,12 +1,13 @@
 //! Deduplicate and batch concurrent async requests.
 //!
-//! Many concurrent `load(input)` calls are merged within a collection window
-//! into a single downstream batch, and duplicate inputs share one result.
-//! There is no cache; the API is trait-based and built on `tokio`.
+//! Concurrent requests within a collection window are merged into a single downstream batch,
+//! and duplicate inputs share one result.
+//! No cache; built on `tokio`.
 //!
-//! The public API is not available yet;
-//! this version ships the crate skeleton only.
+//! This version ships [`queue`] - the pending-request queue underneath the batching side;
+//! the layers on top are not released yet.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 pub mod queue;

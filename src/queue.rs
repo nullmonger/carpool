@@ -1,3 +1,18 @@
+//! Pending requests awaiting a batch.
+//!
+//! A [`Queue`] pairs each input with the [`oneshot::Sender`] its caller awaits.
+//! Batches are sliced off in arrival order: by timer via [`Queue::take`],
+//! or by threshold via [`Queue::take_if`].
+//!
+//! Liveness is read lazily from the channel: a caller leaves by dropping its receiver,
+//! and only the scans inside `take` and `take_if` bury dead entries.
+//!
+//! The queue stores and slices; delivery stays with the consumer.
+//! Send the result into each returned sender;
+//! a send into a closed one is the consumer's deliberate no-op.
+//! Dropping the queue is a regular shutdown:
+//! every waiting caller gets a [`RecvError`](oneshot::error::RecvError).
+
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
 
@@ -9,9 +24,33 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-// A pending request: the input and the channel its caller awaits.
+/// A pending request: the input and the channel its caller awaits.
 pub type Pending<I, O> = (I, oneshot::Sender<O>);
 
+/// Unbounded FIFO queue of pending requests.
+///
+/// [`push`](Queue::push) never fails and never blocks; bounding is the consumer's policy,
+/// as is sharing - wrap the queue in an `Arc` to hand it around.
+///
+/// # Examples
+///
+/// ```
+/// use carpool::queue::Queue;
+/// use tokio::sync::oneshot;
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() {
+/// let queue = Queue::default();
+///
+/// let (tx, rx) = oneshot::channel();
+/// queue.push("carp", tx);
+///
+/// for (input, tx) in queue.take(usize::MAX) {
+///     let _ = tx.send(input.len());
+/// }
+/// assert_eq!(rx.await, Ok(4));
+/// # }
+/// ```
 pub struct Queue<I, O> {
     items: Mutex<VecDeque<Pending<I, O>>>,
     arrivals: Notify,
@@ -27,22 +66,26 @@ impl<I, O> Default for Queue<I, O> {
 }
 
 impl<I, O> Queue<I, O> {
+    /// Appends a pending request and wakes the [`reached`](Queue::reached) waiters.
     pub fn push(&self, input: I, tx: oneshot::Sender<O>) {
         locked(&self.items).push_back((input, tx));
         self.arrivals.notify_waiters();
     }
 
-    // Raw count: entries whose receiver is gone still count until a scan buries them.
+    /// Raw count: entries whose receiver is gone still count until a scan buries them.
     pub fn len(&self) -> usize {
         locked(&self.items).len()
     }
 
+    /// Whether the queue holds no entries, dead or alive.
     pub fn is_empty(&self) -> bool {
         locked(&self.items).is_empty()
     }
 
-    // Up to n still-awaited entries in arrival order.
-    // Dead entries met on the way are dropped and do not count against n.
+    /// Slices up to `n` still-awaited entries in arrival order.
+    ///
+    /// Dead entries met on the way are buried and do not count against `n`;
+    /// `take(usize::MAX)` drains everything alive.
     pub fn take(&self, n: usize) -> Vec<Pending<I, O>> {
         let mut items = locked(&self.items);
         let mut live = Vec::with_capacity(n.min(items.len()));
@@ -57,7 +100,29 @@ impl<I, O> Queue<I, O> {
         live
     }
 
-    // Exactly n live entries or None; the raw-len gate keeps sub-threshold calls O(1).
+    /// Slices exactly `n` live entries, or `None` if there are not enough.
+    ///
+    /// The count is exact - dead entries are buried before the threshold check -
+    /// while the raw-len gate keeps sub-threshold calls O(1):
+    /// a call rejected by the gate does not scan and leaves dead entries in place.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use carpool::queue::Queue;
+    /// use tokio::sync::oneshot;
+    ///
+    /// let queue = Queue::default();
+    /// let mut receivers = Vec::new();
+    /// for input in ["a", "b", "c"] {
+    ///     let (tx, rx) = oneshot::channel::<usize>();
+    ///     queue.push(input, tx);
+    ///     receivers.push(rx);
+    /// }
+    ///
+    /// assert!(queue.take_if(5).is_none());
+    /// assert_eq!(queue.take_if(2).map(|batch| batch.len()), Some(2));
+    /// ```
     pub fn take_if(&self, n: usize) -> Option<Vec<Pending<I, O>>> {
         let mut items = locked(&self.items);
         if items.len() < n {
@@ -70,10 +135,13 @@ impl<I, O> Queue<I, O> {
         Some(items.drain(..n).collect())
     }
 
-    // Resolve once the raw len reaches n.
-    // Enable before the check so a push in the gap is not lost.
+    /// Resolves once the raw [`len`](Queue::len) reaches `n`.
+    ///
+    /// Level-triggered: a queue already at or above `n` resolves immediately.
+    /// Pair it with a timeout to drive the timer slicing path.
     pub async fn reached(&self, n: usize) {
         loop {
+            // Enable before the check so a push in the gap is not lost.
             let mut signal = std::pin::pin!(self.arrivals.notified());
             signal.as_mut().enable();
             if self.len() >= n {
@@ -187,8 +255,8 @@ mod tests {
         q.reached(2).await;
     }
 
-    // Race catalog: no internal timers, so each race is real cross-thread
-    // concurrency, repeated to shake out interleavings.
+    // Race catalog: no internal timers, so each race is real cross-thread concurrency,
+    // repeated to shake out interleavings.
 
     #[test]
     fn race_concurrent_pushes_reach_one_take() {
