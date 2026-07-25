@@ -14,9 +14,9 @@ The crate is built and released feature by feature.
       batches are sliced by timer or by threshold.
 - [ ] `Deduplicator` - single-flight per input over a user-implemented `Fetcher`;
       a flight lives while at least one caller is still waiting.
-- [ ] `Batcher` - collection-window batching over a user-implemented `BatchCollector`,
+- [ ] `Loader` - single-flight per input in front of collection-window batching
+      over a user-implemented `BatchCollector`,
       with an input-addressed result contract.
-- [ ] `Loader` - deduplication in front of batching.
 - [ ] Metrics - instrumentation of windows, batches, and flights.
 - [ ] Tracing - OpenTelemetry spans linked to individual `load` calls.
 
