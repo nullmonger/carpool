@@ -56,25 +56,59 @@ impl<F: Fetcher> Deduplicator<F> {
         registry.insert(input, entry.clone());
         drop(registry);
 
-        tokio::spawn(fly(
-            self.fetcher.clone(),
-            self.registry.clone(),
-            for_flight,
-            entry,
-        ));
+        // Nothing may fail between the insert and the armed checkout,
+        // or the entry outlives the only owner able to take it back.
+        let checkout = Checkout::new(self.registry.clone(), for_flight);
+        tokio::spawn(fly(self.fetcher.clone(), checkout, entry));
         waiter
     }
 }
 
-async fn fly<F: Fetcher>(fetcher: F, registry: Registry<F>, input: F::Input, entry: Entry<F>) {
-    let outcome = fetcher.load(input.clone()).await.map_err(DedupError::Load);
+struct Checkout<F: Fetcher> {
+    registry: Registry<F>,
+    input: F::Input,
+    armed: bool,
+}
+
+impl<F: Fetcher> Checkout<F> {
+    fn new(registry: Registry<F>, input: F::Input) -> Self {
+        Self {
+            registry,
+            input,
+            armed: true,
+        }
+    }
+
+    // Disarming keeps the lock untouched once the entry is gone:
+    // a second check-out would take whichever flight holds the input now.
+    fn check_out(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+
+        // The named pair outlives the temporary guard, so consumer-owned values drop unlocked.
+        let checked_out = locked(&self.registry).remove_entry(&self.input);
+        drop(checked_out);
+    }
+}
+
+impl<F: Fetcher> Drop for Checkout<F> {
+    fn drop(&mut self) {
+        self.check_out();
+    }
+}
+
+async fn fly<F: Fetcher>(fetcher: F, mut checkout: Checkout<F>, entry: Entry<F>) {
+    let outcome = fetcher
+        .load(checkout.input.clone())
+        .await
+        .map_err(DedupError::Load);
 
     // Checking out before sending frees the input for the next call;
     // nothing may yield in between, or a waiter is left without an outcome.
-    // The named pair outlives the temporary guard, so consumer-owned values drop unlocked.
-    let checked_out = locked(&registry).remove_entry(&input);
+    checkout.check_out();
     entry.send_replace(Some(outcome));
-    drop(checked_out);
 }
 
 #[cfg(test)]
@@ -161,6 +195,32 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct Panicking {
+        fetches: Arc<AtomicUsize>,
+    }
+
+    impl Fetcher for Panicking {
+        type Input = u64;
+        type Output = u64;
+        type Error = Infallible;
+
+        async fn load(&self, _input: u64) -> Result<u64, Infallible> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            panic!("the fetch blows up")
+        }
+    }
+
+    fn panicking() -> (Panicking, Arc<AtomicUsize>) {
+        let fetches = Arc::new(AtomicUsize::new(0));
+        (
+            Panicking {
+                fetches: fetches.clone(),
+            },
+            fetches,
+        )
+    }
+
     // Seats one flight and holds it, so other calls can join.
     #[derive(Clone)]
     struct Holding {
@@ -220,6 +280,23 @@ mod tests {
 
         assert!(matches!(d.call(3).await, Err(DedupError::Load(Boom))));
         assert_eq!(d.call(3).await.unwrap(), 9);
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_lost_flight_reaches_the_waiter_and_frees_the_input() {
+        let (fetcher, fetches) = panicking();
+        let d = Deduplicator::new(fetcher);
+
+        let first = timeout(GUARD, d.call(7))
+            .await
+            .expect("a lost flight must not hang its waiter");
+        let second = timeout(GUARD, d.call(7))
+            .await
+            .expect("the input must be free again");
+
+        assert!(matches!(first, Err(DedupError::Lost)));
+        assert!(matches!(second, Err(DedupError::Lost)));
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
     }
 
