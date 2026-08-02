@@ -8,7 +8,8 @@ use crate::fetcher::Fetcher;
 
 type Outcome<F> = Result<<F as Fetcher>::Output, DedupError<<F as Fetcher>::Error>>;
 type Entry<F> = Arc<watch::Sender<Option<Outcome<F>>>>;
-type Registry<F> = Arc<Mutex<HashMap<<F as Fetcher>::Input, Entry<F>>>>;
+type Entries<F> = HashMap<<F as Fetcher>::Input, Entry<F>>;
+type Registry<F> = Arc<Mutex<Entries<F>>>;
 
 // A panic under the lock must not brick the registry: recover the poisoned mutex.
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -56,8 +57,7 @@ impl<F: Fetcher> Deduplicator<F> {
         registry.insert(input, entry.clone());
         drop(registry);
 
-        // Nothing may fail between the insert and the armed checkout,
-        // or the entry outlives the only owner able to take it back.
+        // Armed before anything fallible runs: a panic here still has to clear the entry.
         let checkout = Checkout::new(self.registry.clone(), for_flight);
         tokio::spawn(fly(self.fetcher.clone(), checkout, entry));
         waiter
@@ -79,16 +79,25 @@ impl<F: Fetcher> Checkout<F> {
         }
     }
 
-    // Disarming keeps the lock untouched once the entry is gone:
-    // a second check-out would take whichever flight holds the input now.
+    // Idempotent: a second check-out would take whichever flight owns the input by then.
+    #[must_use = "drop the checked-out entry after releasing the lock"]
+    fn check_out_in(&mut self, entries: &mut Entries<F>) -> Option<(F::Input, Entry<F>)> {
+        if !self.armed {
+            return None;
+        }
+        self.armed = false;
+        entries.remove_entry(&self.input)
+    }
+
     fn check_out(&mut self) {
+        // Nothing to take, so the lock stays untouched.
         if !self.armed {
             return;
         }
-        self.armed = false;
-
-        // The named pair outlives the temporary guard, so consumer-owned values drop unlocked.
-        let checked_out = locked(&self.registry).remove_entry(&self.input);
+        // The guard has to borrow the Arc, not `self`.
+        let registry = self.registry.clone();
+        // Named, so the pair outlives the guard.
+        let checked_out = self.check_out_in(&mut locked(&registry));
         drop(checked_out);
     }
 }
@@ -123,6 +132,7 @@ mod tests {
     use tokio::sync::{Barrier, Notify};
     use tokio::time::timeout;
 
+    use super::locked;
     use crate::{DedupError, Deduplicator, Fetcher};
 
     // Wall-clock only guards against a hang, never times an interleaving.
@@ -221,7 +231,7 @@ mod tests {
         )
     }
 
-    // Seats one flight and holds it, so other calls can join.
+    // Holds one flight inside the fetch, so other calls can join it.
     #[derive(Clone)]
     struct Holding {
         fetches: Arc<AtomicUsize>,
@@ -281,6 +291,7 @@ mod tests {
         assert!(matches!(d.call(3).await, Err(DedupError::Load(Boom))));
         assert_eq!(d.call(3).await.unwrap(), 9);
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert!(locked(&d.registry).is_empty());
     }
 
     #[tokio::test]
@@ -298,6 +309,7 @@ mod tests {
         assert!(matches!(first, Err(DedupError::Lost)));
         assert!(matches!(second, Err(DedupError::Lost)));
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert!(locked(&d.registry).is_empty());
     }
 
     // The flight cannot start until this task yields,
@@ -342,6 +354,7 @@ mod tests {
         assert_eq!(d.call(5).await.unwrap(), 25);
         assert_eq!(d.call(5).await.unwrap(), 25);
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert!(locked(&d.registry).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -369,7 +382,7 @@ mod tests {
             tokio::join!(d.call(7), async { gate.notify_one() })
         })
         .await
-        .expect("the follower must join the seated flight");
+        .expect("the follower must join the open flight");
 
         assert_eq!(follower.unwrap(), 49);
         let leader = timeout(GUARD, leader)
