@@ -7,8 +7,10 @@
 #![forbid(unsafe_code)]
 
 mod deduplicator;
+mod error;
 mod fetcher;
 pub mod queue;
 
 pub use deduplicator::Deduplicator;
+pub use error::DedupError;
 pub use fetcher::Fetcher;
