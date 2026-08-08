@@ -92,8 +92,8 @@ impl<F: Fetcher> Checkout<F> {
         entries.remove_entry(&self.input)
     }
 
-    // The re-check and the removal share one critical section: the lock is not reentrant,
-    // and letting go in between lets a waiter subscribe to an entry that is about to go.
+    // The lock is not reentrant, so the re-check and the removal cannot be split:
+    // a waiter would subscribe to an entry that is about to go.
     fn check_out_if_empty(&mut self, entry: &Entry<F>) -> bool {
         let registry = self.registry.clone();
         let mut entries = locked(&registry);
@@ -130,8 +130,7 @@ async fn fly<F: Fetcher>(fetcher: F, mut checkout: Checkout<F>, entry: Entry<F>)
     let mut emptied = pin!(entry.closed());
 
     let outcome = loop {
-        // The fetch wins a tie: an outcome already in hand
-        // beats an emptiness that arrived with it.
+        // A tie goes to the fetch: an outcome in hand beats an emptiness that arrived with it.
         let fetched = poll_fn(|cx| match fetch.as_mut().poll(cx) {
             Poll::Ready(outcome) => Poll::Ready(Some(outcome)),
             Poll::Pending => emptied.as_mut().poll(cx).map(|()| None),
@@ -166,7 +165,7 @@ mod tests {
     use std::task::{Context, Waker};
     use std::time::Duration;
 
-    use tokio::sync::{Barrier, Notify};
+    use tokio::sync::{Barrier, Notify, Semaphore};
     use tokio::time::timeout;
 
     use super::locked;
@@ -175,9 +174,20 @@ mod tests {
     // Wall-clock only guards against a hang, never times an interleaving.
     const GUARD: Duration = Duration::from_secs(5);
 
+    // Rounds per race, so a rare interleaving still shows up.
+    const ROUNDS: usize = 50;
+
     #[derive(Clone)]
     struct Counting {
         fetches: Arc<AtomicUsize>,
+    }
+
+    impl Counting {
+        fn new() -> Self {
+            Self {
+                fetches: Arc::new(AtomicUsize::new(0)),
+            }
+        }
     }
 
     impl Fetcher for Counting {
@@ -189,16 +199,6 @@ mod tests {
             self.fetches.fetch_add(1, Ordering::SeqCst);
             Ok(input * input)
         }
-    }
-
-    fn counting() -> (Counting, Arc<AtomicUsize>) {
-        let fetches = Arc::new(AtomicUsize::new(0));
-        (
-            Counting {
-                fetches: fetches.clone(),
-            },
-            fetches,
-        )
     }
 
     #[derive(Debug, Clone)]
@@ -218,6 +218,15 @@ mod tests {
         failures: usize,
     }
 
+    impl Failing {
+        fn new(failures: usize) -> Self {
+            Self {
+                fetches: Arc::new(AtomicUsize::new(0)),
+                failures,
+            }
+        }
+    }
+
     impl Fetcher for Failing {
         type Input = u64;
         type Output = u64;
@@ -231,20 +240,17 @@ mod tests {
         }
     }
 
-    fn failing(failures: usize) -> (Failing, Arc<AtomicUsize>) {
-        let fetches = Arc::new(AtomicUsize::new(0));
-        (
-            Failing {
-                fetches: fetches.clone(),
-                failures,
-            },
-            fetches,
-        )
-    }
-
     #[derive(Clone)]
     struct Panicking {
         fetches: Arc<AtomicUsize>,
+    }
+
+    impl Panicking {
+        fn new() -> Self {
+            Self {
+                fetches: Arc::new(AtomicUsize::new(0)),
+            }
+        }
     }
 
     impl Fetcher for Panicking {
@@ -258,23 +264,14 @@ mod tests {
         }
     }
 
-    fn panicking() -> (Panicking, Arc<AtomicUsize>) {
-        let fetches = Arc::new(AtomicUsize::new(0));
-        (
-            Panicking {
-                fetches: fetches.clone(),
-            },
-            fetches,
-        )
-    }
-
     // Holds one flight inside the fetch, so other calls can join it,
     // and tells apart a fetch that ran to the end from one dropped midway.
     #[derive(Clone)]
     struct Holding {
         fetches: Arc<AtomicUsize>,
         entered: Arc<Notify>,
-        gate: Arc<Notify>,
+        // A permit returns when the fetch passes, so one open serves the next flight too.
+        gate: Arc<Semaphore>,
         completed: Arc<AtomicBool>,
         cancelled: Arc<Notify>,
     }
@@ -284,10 +281,14 @@ mod tests {
             Self {
                 fetches: Arc::new(AtomicUsize::new(0)),
                 entered: Arc::new(Notify::new()),
-                gate: Arc::new(Notify::new()),
+                gate: Arc::new(Semaphore::new(0)),
                 completed: Arc::new(AtomicBool::new(false)),
                 cancelled: Arc::new(Notify::new()),
             }
+        }
+
+        fn open_gate(&self) {
+            self.gate.add_permits(1);
         }
     }
 
@@ -300,14 +301,13 @@ mod tests {
             let mut fetch = Interrupted::new(self.cancelled.clone());
             self.fetches.fetch_add(1, Ordering::SeqCst);
             self.entered.notify_one();
-            self.gate.notified().await;
+            let _permit = self.gate.acquire().await.expect("the gate is never closed");
             self.completed.store(true, Ordering::SeqCst);
             fetch.complete();
             Ok(input * input)
         }
     }
 
-    // Signals on drop unless what it watches ran to the end.
     struct Interrupted {
         signal: Arc<Notify>,
         done: bool,
@@ -342,6 +342,16 @@ mod tests {
         folded: Arc<Notify>,
     }
 
+    impl Spawning {
+        fn new() -> Self {
+            Self {
+                inner: Holding::new(),
+                finished: Arc::new(Notify::new()),
+                folded: Arc::new(Notify::new()),
+            }
+        }
+    }
+
     impl Fetcher for Spawning {
         type Input = u64;
         type Output = u64;
@@ -374,15 +384,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_call_delivers_the_fetched_value() {
-        let (fetcher, _) = counting();
-        let d = Deduplicator::new(fetcher);
+        let d = Deduplicator::new(Counting::new());
         assert_eq!(d.call(7).await.unwrap(), 49);
     }
 
     #[tokio::test]
     async fn a_failed_fetch_reaches_the_caller_with_its_cause() {
-        let (fetcher, _) = failing(usize::MAX);
-        let d = Deduplicator::new(fetcher);
+        let d = Deduplicator::new(Failing::new(usize::MAX));
 
         let err = d.call(1).await.unwrap_err();
 
@@ -392,12 +400,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_fetch_is_shared_by_the_collapsed_calls() {
-        let (fetcher, fetches) = failing(usize::MAX);
-        let d = Deduplicator::new(fetcher);
+        let fetcher = Failing::new(usize::MAX);
+        let d = Deduplicator::new(fetcher.clone());
 
         let (o1, o2, o3) = tokio::join!(d.call(7), d.call(7), d.call(7));
 
-        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(fetcher.fetches.load(Ordering::SeqCst), 1);
         for outcome in [o1, o2, o3] {
             assert!(matches!(outcome, Err(DedupError::Load(Boom))));
         }
@@ -405,19 +413,19 @@ mod tests {
 
     #[tokio::test]
     async fn the_input_is_free_after_a_failed_fetch() {
-        let (fetcher, fetches) = failing(1);
-        let d = Deduplicator::new(fetcher);
+        let fetcher = Failing::new(1);
+        let d = Deduplicator::new(fetcher.clone());
 
         assert!(matches!(d.call(3).await, Err(DedupError::Load(Boom))));
         assert_eq!(d.call(3).await.unwrap(), 9);
-        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(fetcher.fetches.load(Ordering::SeqCst), 2);
         assert!(locked(&d.registry).is_empty());
     }
 
     #[tokio::test]
     async fn a_lost_flight_reaches_the_waiter_and_frees_the_input() {
-        let (fetcher, fetches) = panicking();
-        let d = Deduplicator::new(fetcher);
+        let fetcher = Panicking::new();
+        let d = Deduplicator::new(fetcher.clone());
 
         let first = timeout(GUARD, d.call(7))
             .await
@@ -428,7 +436,7 @@ mod tests {
 
         assert!(matches!(first, Err(DedupError::Lost)));
         assert!(matches!(second, Err(DedupError::Lost)));
-        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(fetcher.fetches.load(Ordering::SeqCst), 2);
         assert!(locked(&d.registry).is_empty());
     }
 
@@ -436,13 +444,13 @@ mod tests {
     // and every call subscribes before the first yield, so the count proves the collapse.
     #[tokio::test]
     async fn concurrent_calls_of_one_input_collapse_to_one_flight() {
-        let (fetcher, fetches) = counting();
-        let d = Deduplicator::new(fetcher);
+        let fetcher = Counting::new();
+        let d = Deduplicator::new(fetcher.clone());
 
         let (o1, o2, o3, o4, o5) =
             tokio::join!(d.call(7), d.call(7), d.call(7), d.call(7), d.call(7));
 
-        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(fetcher.fetches.load(Ordering::SeqCst), 1);
         assert_eq!(
             [
                 o1.unwrap(),
@@ -457,23 +465,23 @@ mod tests {
 
     #[tokio::test]
     async fn distinct_inputs_each_open_their_own_flight() {
-        let (fetcher, fetches) = counting();
-        let d = Deduplicator::new(fetcher);
+        let fetcher = Counting::new();
+        let d = Deduplicator::new(fetcher.clone());
 
         let (a, b, c) = tokio::join!(d.call(2), d.call(3), d.call(4));
 
         assert_eq!((a.unwrap(), b.unwrap(), c.unwrap()), (4, 9, 16));
-        assert_eq!(fetches.load(Ordering::SeqCst), 3);
+        assert_eq!(fetcher.fetches.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
     async fn a_call_after_the_flight_opens_a_new_one() {
-        let (fetcher, fetches) = counting();
-        let d = Deduplicator::new(fetcher);
+        let fetcher = Counting::new();
+        let d = Deduplicator::new(fetcher.clone());
 
         assert_eq!(d.call(5).await.unwrap(), 25);
         assert_eq!(d.call(5).await.unwrap(), 25);
-        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(fetcher.fetches.load(Ordering::SeqCst), 2);
         assert!(locked(&d.registry).is_empty());
     }
 
@@ -493,7 +501,7 @@ mod tests {
         // The follower subscribes in the first branch;
         // the flight is released only by the second, so it cannot settle before the join.
         let (follower, ()) = timeout(GUARD, async {
-            tokio::join!(d.call(7), async { fetcher.gate.notify_one() })
+            tokio::join!(d.call(7), async { fetcher.open_gate() })
         })
         .await
         .expect("the follower must join the open flight");
@@ -525,7 +533,7 @@ mod tests {
             poll_once(leaves.as_mut());
         }
 
-        fetcher.gate.notify_one();
+        fetcher.open_gate();
         let stayed = timeout(GUARD, stays)
             .await
             .expect("the remaining caller must not hang")
@@ -542,8 +550,8 @@ mod tests {
         let d = Deduplicator::new(fetcher.clone());
 
         {
-            let mut only = pin!(d.call(7));
-            poll_once(only.as_mut());
+            let mut last = pin!(d.call(7));
+            poll_once(last.as_mut());
             timeout(GUARD, fetcher.entered.notified())
                 .await
                 .expect("the flight must reach the fetcher");
@@ -563,8 +571,8 @@ mod tests {
         let d = Deduplicator::new(fetcher.clone());
 
         {
-            let mut only = pin!(d.call(7));
-            poll_once(only.as_mut());
+            let mut last = pin!(d.call(7));
+            poll_once(last.as_mut());
             timeout(GUARD, fetcher.entered.notified())
                 .await
                 .expect("the flight must reach the fetcher");
@@ -573,7 +581,7 @@ mod tests {
             .await
             .expect("the flight must fold");
 
-        fetcher.gate.notify_one();
+        fetcher.open_gate();
         let value = timeout(GUARD, d.call(7))
             .await
             .expect("the input must be free again");
@@ -584,41 +592,35 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fetch_of_its_own_task_outlives_the_fold() {
-        let inner = Holding::new();
-        let finished = Arc::new(Notify::new());
-        let folded = Arc::new(Notify::new());
-        let d = Deduplicator::new(Spawning {
-            inner: inner.clone(),
-            finished: finished.clone(),
-            folded: folded.clone(),
-        });
+        let fetcher = Spawning::new();
+        let d = Deduplicator::new(fetcher.clone());
 
         {
-            let mut only = pin!(d.call(7));
-            poll_once(only.as_mut());
-            timeout(GUARD, inner.entered.notified())
+            let mut last = pin!(d.call(7));
+            poll_once(last.as_mut());
+            timeout(GUARD, fetcher.inner.entered.notified())
                 .await
                 .expect("the flight must reach the fetcher");
         }
-        timeout(GUARD, folded.notified())
+        timeout(GUARD, fetcher.folded.notified())
             .await
             .expect("the flight must fold");
 
-        inner.gate.notify_one();
-        timeout(GUARD, finished.notified())
+        fetcher.inner.open_gate();
+        timeout(GUARD, fetcher.finished.notified())
             .await
             .expect("a fetch of its own task must run to the end");
 
-        assert!(inner.completed.load(Ordering::SeqCst));
+        assert!(fetcher.inner.completed.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn race_concurrent_calls_of_one_input_leave_it_free() {
         const CALLERS: usize = 8;
 
-        for _ in 0..50 {
-            let (fetcher, fetches) = counting();
-            let d = Deduplicator::new(fetcher);
+        for _ in 0..ROUNDS {
+            let fetcher = Counting::new();
+            let d = Deduplicator::new(fetcher.clone());
             let start = Arc::new(Barrier::new(CALLERS));
 
             let callers: Vec<_> = (0..CALLERS)
@@ -641,12 +643,120 @@ mod tests {
             }
 
             // However many fetches the interleaving cost, the input is free once the racers finish.
-            let before = fetches.load(Ordering::SeqCst);
+            let before = fetcher.fetches.load(Ordering::SeqCst);
             let after = timeout(GUARD, d.call(7))
                 .await
                 .expect("the input must be free again");
             assert_eq!(after.unwrap(), 49);
-            assert_eq!(fetches.load(Ordering::SeqCst), before + 1);
+            assert_eq!(fetcher.fetches.load(Ordering::SeqCst), before + 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn race_a_call_meeting_the_emptying_is_never_left_unanswered() {
+        for _ in 0..ROUNDS {
+            let fetcher = Holding::new();
+            let d = Deduplicator::new(fetcher.clone());
+
+            // Boxed, so the waiter can leave at a chosen moment instead of at the end of a scope.
+            let mut leaving = Box::pin(d.call(7));
+            poll_once(leaving.as_mut());
+            timeout(GUARD, fetcher.entered.notified())
+                .await
+                .expect("the flight must reach the fetcher");
+
+            let start = Arc::new(Barrier::new(2));
+            let arriving = tokio::spawn({
+                let d = d.clone();
+                let start = start.clone();
+                async move {
+                    start.wait().await;
+                    d.call(7).await
+                }
+            });
+
+            start.wait().await;
+            drop(leaving);
+            fetcher.open_gate();
+
+            // Joining the flight or opening a new one are both fine; going unanswered is not.
+            let answer = timeout(GUARD, arriving)
+                .await
+                .expect("the arriving call must not hang")
+                .unwrap();
+            assert_eq!(answer.unwrap(), 49);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn race_a_call_arriving_at_the_emptying_keeps_the_flight_in_the_air() {
+        for _ in 0..ROUNDS {
+            let fetcher = Holding::new();
+            let d = Deduplicator::new(fetcher.clone());
+
+            let mut leaving = Box::pin(d.call(7));
+            poll_once(leaving.as_mut());
+            timeout(GUARD, fetcher.entered.notified())
+                .await
+                .expect("the flight must reach the fetcher");
+
+            // Subscribed under the registry lock, the way a joining call does;
+            // a caller leaving does not reach for that lock, so holding it here cannot deadlock.
+            let mut arriving = {
+                let entries = locked(&d.registry);
+                drop(leaving);
+                entries
+                    .get(&7)
+                    .expect("the entry outlives the waiter that left")
+                    .subscribe()
+            };
+
+            fetcher.open_gate();
+            timeout(GUARD, arriving.changed())
+                .await
+                .expect("the flight must deliver instead of hanging")
+                .expect("the emptiness must not carry off a flight that has a waiter again");
+
+            let outcome = arriving
+                .borrow_and_update()
+                .clone()
+                .expect("a change carries the outcome");
+            assert_eq!(outcome.unwrap(), 49);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn race_the_flight_folds_when_the_waiter_that_kept_it_leaves_too() {
+        for _ in 0..ROUNDS {
+            let fetcher = Holding::new();
+            let d = Deduplicator::new(fetcher.clone());
+
+            let mut leaving = Box::pin(d.call(7));
+            poll_once(leaving.as_mut());
+            timeout(GUARD, fetcher.entered.notified())
+                .await
+                .expect("the flight must reach the fetcher");
+
+            let waiter = {
+                let entries = locked(&d.registry);
+                drop(leaving);
+                entries
+                    .get(&7)
+                    .expect("the entry outlives the waiter that left")
+                    .subscribe()
+            };
+
+            // The interleaving decides whether the flight refuses a fold or misses the emptiness;
+            // the rounds are here to walk through both.
+            tokio::task::yield_now().await;
+            drop(waiter);
+
+            timeout(GUARD, fetcher.cancelled.notified())
+                .await
+                .expect("the flight must fold once nobody waits for it");
+
+            assert!(!fetcher.completed.load(Ordering::SeqCst));
+            assert!(locked(&d.registry).is_empty());
         }
     }
 }
