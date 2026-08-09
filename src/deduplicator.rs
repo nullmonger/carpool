@@ -159,6 +159,7 @@ mod tests {
     use std::error::Error;
     use std::fmt;
     use std::future::Future;
+    use std::hash::{Hash, Hasher};
     use std::pin::{Pin, pin};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -370,6 +371,31 @@ mod tests {
             let outcome = fetch.await.expect("the spawned fetch must not panic");
             flight.complete();
             outcome
+        }
+    }
+
+    // The registry hashes the input under its own lock,
+    // so a panic here is user code blowing up inside the critical section.
+    #[derive(Clone, PartialEq, Eq)]
+    struct Brittle(u64);
+
+    impl Hash for Brittle {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            assert!(self.0 != 0, "hashing the input blows up");
+            self.0.hash(state);
+        }
+    }
+
+    #[derive(Clone)]
+    struct Plain;
+
+    impl Fetcher for Plain {
+        type Input = Brittle;
+        type Output = u64;
+        type Error = Infallible;
+
+        async fn load(&self, input: Brittle) -> Result<u64, Infallible> {
+            Ok(input.0 * input.0)
         }
     }
 
@@ -615,40 +641,109 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn race_concurrent_calls_of_one_input_leave_it_free() {
-        const CALLERS: usize = 8;
+    async fn flights_survive_a_released_handle() {
+        const INPUTS: u64 = 3;
 
-        for _ in 0..ROUNDS {
-            let fetcher = Counting::new();
-            let d = Deduplicator::new(fetcher.clone());
-            let start = Arc::new(Barrier::new(CALLERS));
+        let fetcher = Holding::new();
+        let d = Deduplicator::new(fetcher.clone());
+        // The registry has to stay observable once the handle is released.
+        let registry = d.registry.clone();
 
-            let callers: Vec<_> = (0..CALLERS)
-                .map(|_| {
-                    let d = d.clone();
-                    let start = start.clone();
-                    tokio::spawn(async move {
-                        start.wait().await;
-                        d.call(7).await
-                    })
-                })
-                .collect();
+        let callers: Vec<_> = (0..INPUTS)
+            .map(|input| {
+                let d = d.clone();
+                tokio::spawn(async move { (input, d.call(input).await) })
+            })
+            .collect();
 
-            for caller in callers {
-                let outcome = timeout(GUARD, caller)
-                    .await
-                    .expect("no caller may hang")
-                    .unwrap();
-                assert_eq!(outcome.unwrap(), 49);
+        timeout(GUARD, async {
+            while fetcher.fetches.load(Ordering::SeqCst) < INPUTS as usize {
+                tokio::task::yield_now().await;
             }
+        })
+        .await
+        .expect("every flight must reach the fetcher");
 
-            // However many fetches the interleaving cost, the input is free once the racers finish.
-            let before = fetcher.fetches.load(Ordering::SeqCst);
-            let after = timeout(GUARD, d.call(7))
+        drop(d);
+        for _ in 0..INPUTS {
+            fetcher.open_gate();
+        }
+
+        for caller in callers {
+            let (input, outcome) = timeout(GUARD, caller)
                 .await
-                .expect("the input must be free again");
-            assert_eq!(after.unwrap(), 49);
-            assert_eq!(fetcher.fetches.load(Ordering::SeqCst), before + 1);
+                .expect("no caller may hang")
+                .unwrap();
+            assert_eq!(outcome.unwrap(), input * input);
+        }
+        assert!(locked(&registry).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_panic_under_the_registry_lock_leaves_the_deduplicator_serving() {
+        let d = Deduplicator::new(Plain);
+
+        let blown = timeout(
+            GUARD,
+            tokio::spawn({
+                let d = d.clone();
+                async move { d.call(Brittle(0)).await }
+            }),
+        )
+        .await
+        .expect("the panicking call must not hang");
+        assert!(
+            blown.is_err_and(|joined| joined.is_panic()),
+            "the call must carry the panic instead of an outcome"
+        );
+
+        let value = timeout(GUARD, d.call(Brittle(7)))
+            .await
+            .expect("the poisoned registry must not stall the next call");
+        assert_eq!(value.unwrap(), 49);
+        assert!(locked(&d.registry).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn race_a_call_meeting_the_settling_flight_gets_an_answer() {
+        for _ in 0..ROUNDS {
+            let fetcher = Holding::new();
+            let d = Deduplicator::new(fetcher.clone());
+
+            // The first caller stays: a flight nobody waits for folds instead of settling.
+            let waiting = tokio::spawn({
+                let d = d.clone();
+                async move { d.call(7).await }
+            });
+            timeout(GUARD, fetcher.entered.notified())
+                .await
+                .expect("the flight must reach the fetcher");
+
+            // Both sides queue on the registry lock: the settling flight to check its entry out,
+            // the arriving call to look it up.
+            let arriving = {
+                let entries = locked(&d.registry);
+                fetcher.open_gate();
+                let arriving = tokio::spawn({
+                    let d = d.clone();
+                    async move { d.call(7).await }
+                });
+                drop(entries);
+                arriving
+            };
+
+            let answer = timeout(GUARD, arriving)
+                .await
+                .expect("the arriving call must not hang")
+                .unwrap();
+            assert_eq!(answer.unwrap(), 49);
+
+            let waited = timeout(GUARD, waiting)
+                .await
+                .expect("the waiter must resolve too")
+                .unwrap();
+            assert_eq!(waited.unwrap(), 49);
+            assert!(locked(&d.registry).is_empty());
         }
     }
 
@@ -685,6 +780,7 @@ mod tests {
                 .expect("the arriving call must not hang")
                 .unwrap();
             assert_eq!(answer.unwrap(), 49);
+            assert!(locked(&d.registry).is_empty());
         }
     }
 
@@ -722,6 +818,7 @@ mod tests {
                 .clone()
                 .expect("a change carries the outcome");
             assert_eq!(outcome.unwrap(), 49);
+            assert!(locked(&d.registry).is_empty());
         }
     }
 
@@ -756,6 +853,126 @@ mod tests {
                 .expect("the flight must fold once nobody waits for it");
 
             assert!(!fetcher.completed.load(Ordering::SeqCst));
+            assert!(locked(&d.registry).is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn race_calls_from_separate_tasks_join_one_flight() {
+        const CALLERS: usize = 8;
+
+        for _ in 0..ROUNDS {
+            let fetcher = Holding::new();
+            let d = Deduplicator::new(fetcher.clone());
+            let start = Arc::new(Barrier::new(CALLERS));
+
+            let callers: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    let d = d.clone();
+                    let start = start.clone();
+                    tokio::spawn(async move {
+                        start.wait().await;
+                        d.call(7).await
+                    })
+                })
+                .collect();
+
+            // The held fetch keeps the entry in place, so the last caller still has one to join.
+            timeout(GUARD, async {
+                loop {
+                    let joined = locked(&d.registry)
+                        .get(&7)
+                        .map_or(0, |entry| entry.receiver_count());
+                    if joined == CALLERS {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("every caller must reach the entry");
+            fetcher.open_gate();
+
+            for caller in callers {
+                let outcome = timeout(GUARD, caller)
+                    .await
+                    .expect("no caller may hang")
+                    .unwrap();
+                assert_eq!(outcome.unwrap(), 49);
+            }
+
+            assert_eq!(fetcher.fetches.load(Ordering::SeqCst), 1);
+            assert!(locked(&d.registry).is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn race_concurrent_calls_of_one_input_leave_it_free() {
+        const CALLERS: usize = 8;
+
+        for _ in 0..ROUNDS {
+            let fetcher = Counting::new();
+            let d = Deduplicator::new(fetcher.clone());
+            let start = Arc::new(Barrier::new(CALLERS));
+
+            let callers: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    let d = d.clone();
+                    let start = start.clone();
+                    tokio::spawn(async move {
+                        start.wait().await;
+                        d.call(7).await
+                    })
+                })
+                .collect();
+
+            for caller in callers {
+                let outcome = timeout(GUARD, caller)
+                    .await
+                    .expect("no caller may hang")
+                    .unwrap();
+                assert_eq!(outcome.unwrap(), 49);
+            }
+
+            // However many fetches the interleaving cost, the input is free once the racers finish.
+            let before = fetcher.fetches.load(Ordering::SeqCst);
+            let after = timeout(GUARD, d.call(7))
+                .await
+                .expect("the input must be free again");
+            assert_eq!(after.unwrap(), 49);
+            assert_eq!(fetcher.fetches.load(Ordering::SeqCst), before + 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn race_calls_of_distinct_inputs_do_not_collide() {
+        const INPUTS: u64 = 8;
+
+        for _ in 0..ROUNDS {
+            let fetcher = Counting::new();
+            let d = Deduplicator::new(fetcher.clone());
+            let start = Arc::new(Barrier::new(INPUTS as usize));
+
+            let callers: Vec<_> = (0..INPUTS)
+                .map(|input| {
+                    let d = d.clone();
+                    let start = start.clone();
+                    tokio::spawn(async move {
+                        start.wait().await;
+                        (input, d.call(input).await)
+                    })
+                })
+                .collect();
+
+            for caller in callers {
+                let (input, outcome) = timeout(GUARD, caller)
+                    .await
+                    .expect("no caller may hang")
+                    .unwrap();
+                assert_eq!(outcome.unwrap(), input * input);
+            }
+
+            assert_eq!(fetcher.fetches.load(Ordering::SeqCst), INPUTS as usize);
             assert!(locked(&d.registry).is_empty());
         }
     }
