@@ -9,7 +9,3 @@ duplicate keys share one result. No cache, trait-based API, built on `tokio`.
 Early development, pre-release. The public API is not available yet.
 Installation and usage are documented once it stabilizes.
 
-## License
-
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
